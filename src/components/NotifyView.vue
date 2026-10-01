@@ -24,7 +24,8 @@
           <div class="t-head">
             <span class="st" :class="t.status">{{ t.statusText }}</span>
             <b class="t-title">{{ t.title }}</b>
-            <span class="kind">{{ t.kind==='alert' ? '🚨 预警' : t.kind==='workorder' ? '📋 工单' : t.kind==='prop' ? '🕸 传播' : '🛟 危机' }}</span>
+            <span class="kind">{{ kindText(t) }}</span>
+            <span v-if="t.corr_id" class="corr" :title="'调度链路：' + t.corr_id + '（第 ' + t.seq + ' 轮）'">🔗 {{ corrShort(t.corr_id) }}<template v-if="t.seq">#{{ t.seq }}</template></span>
             <span v-if="t.escalated_from" class="esc-tag">⬆ 升级自 #{{ t.escalated_from }}</span>
           </div>
           <div class="t-content">{{ t.content }}</div>
@@ -235,6 +236,19 @@ const openCount = computed(() => (counts.value.pending || 0) + (counts.value.fai
 const totalCount = computed(() => Object.values(counts.value).reduce((a, b) => a + b, 0))
 
 function roleText(r) { return { admin: '管理员', ops: '值班员', viewer: '观察员' }[r] || r }
+function kindText(t) {
+  if (t.kind === 'workorder') return '📋 工单'
+  if (t.kind === 'prop') return '🕸 传播'
+  if (t.kind === 'alert') return '🚨 预警'
+  return '🛟 危机'
+}
+// 调度链路关联键简写：wo3:dispatch → 工单#3 分派；wo3:escalate → 工单#3 升级
+function corrShort(c) {
+  const m = String(c).match(/^wo(\d+):(\w+)/)
+  if (!m) return c.length > 14 ? c.slice(0, 14) + '…' : c
+  const phase = { dispatch: '分派', escalate: '升级', ackEsc: '回执升级' }[m[2]] || m[2]
+  return `工单#${m[1]}·${phase}`
+}
 function logActionText(a) {
   return {
     created: '生成', sent: '发送成功', retry: '待重试', failed: '发送失败',
@@ -374,6 +388,7 @@ onUnmounted(() => clearInterval(timer))
 .st.cancelled{background:#21262c;color:#78909c;}
 .t-title{color:#fff;font-size:13px;flex:1;min-width:160px;}
 .kind{font-size:10px;color:#8ba2c8;}
+.corr{font-size:10px;color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.3);border-radius:5px;padding:1px 7px;}
 .esc-tag{font-size:10px;color:#ffcc80;background:#3e2723;border-radius:5px;padding:1px 6px;}
 .t-content{color:#8ba2c8;font-size:11px;margin:6px 0;}
 .t-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:10px;color:#5b6f94;}

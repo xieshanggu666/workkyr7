@@ -9,10 +9,18 @@
         </button>
         <span v-if="summary.overdue" class="chip overdue">⏰ 超时 {{ summary.overdue }}</span>
         <span v-if="summary.escalated" class="chip esc">⬆ 已升级 {{ summary.escalated }}</span>
+        <span v-if="summary.delivery?.pending" class="chip ntf">📤 通知在途 {{ summary.delivery.pending }}</span>
+        <span v-if="summary.delivery?.failed" class="chip ntf-fail">⚠ 通知失败 {{ summary.delivery.failed }}</span>
+        <span v-if="summary.delivery?.retries" class="chip ntf-retry">↻ 自动重试 {{ summary.delivery.retries }}</span>
+        <span v-if="summary.delivery?.acked" class="chip ntf-ack">✔ 已回执 {{ summary.delivery.acked }}</span>
       </div>
       <span class="me">👤 {{ store.user.name }} · {{ roleText(store.user.role) }}</span>
     </div>
-    <p class="hint">🔗 从危机拆分跨角色协同工单：分派/认领 → 处理（可阻塞挂起 SLA）→ 完成回写危机时间线（可联动解除预警）；SLA 超时两级升级并联动通知调度；结案须先完结全部工单。</p>
+    <div v-if="crisisFilter" class="filter-bar">
+      🔎 仅显示危机 #{{ crisisFilter }} 的工单调度链路
+      <button class="clear-filter" @click="clearCrisisFilter">✕ 清除过滤</button>
+    </div>
+    <p class="hint">🔗 分派/改派/认领、SLA 超时升级、通知发送/失败重试/回执/回执升级共享同一调度链路：每张工单可展开「🔗 调度链路」查看归并时间序；工单完成/取消时在途通知自动收敛；结案须先完结全部工单。</p>
 
     <!-- 拆分工单表单 -->
     <form v-if="showForm" class="wo-form" @submit.prevent="create">
@@ -70,7 +78,23 @@
           </span>
           <span v-else-if="w.due_at">⏱ 已截止</span>
           <span v-else>⏱ 无时限</span>
+          <span v-if="w.delivery && w.delivery.total" class="dlv" :class="w.dispatch_state">
+            🔗 通知链路 {{ deliveryText(w) }}
+          </span>
+          <span v-else-if="w.dispatch_state && w.dispatch_state!=='none'" class="dlv" :class="w.dispatch_state">🔗 {{ w.dispatchStateText }}</span>
           <span>更新 <i>{{ w.updated }}</i></span>
+        </div>
+        <!-- 通知调度链路：同一次分派/升级的多渠道任务送达/重试/回执概览 -->
+        <div v-if="w.delivery && w.delivery.total" class="w-delivery">
+          <span class="dlv-title">📨 通知 {{ w.delivery.total }} 个渠道任务</span>
+          <span v-if="w.delivery.pending" class="d-tag pending">待发送 {{ w.delivery.pending }}</span>
+          <span v-if="w.delivery.sent" class="d-tag sent">已送达 {{ w.delivery.sent }}</span>
+          <span v-if="w.delivery.acked" class="d-tag acked">已回执 {{ w.delivery.acked }}</span>
+          <span v-if="w.delivery.escalated" class="d-tag esc">回执超时升级 {{ w.delivery.escalated }}</span>
+          <span v-if="w.delivery.failed" class="d-tag failed">发送失败 {{ w.delivery.failed }}</span>
+          <span v-if="w.delivery.paused" class="d-tag paused">已暂停 {{ w.delivery.paused }}</span>
+          <span v-if="w.delivery.cancelled" class="d-tag cancelled">已取消 {{ w.delivery.cancelled }}</span>
+          <span v-if="w.delivery.retries" class="d-tag retry">↻ 重试 {{ w.delivery.retries }} 次</span>
         </div>
         <div v-if="w.status==='blocked' && w.blocked_reason" class="w-blocked">🚧 阻塞：{{ w.blocked_reason }}（SLA 已挂起）</div>
         <div v-if="w.result" class="w-result">✅ 处理结果：{{ w.result }}<em v-if="w.resolve_alerts">（已联动解除该事件全部未解除预警）</em></div>
@@ -85,14 +109,27 @@
           <button v-if="['todo','doing','blocked'].includes(w.status)" class="op cancel" @click="cancel(w)">✕ 取消</button>
           <button class="op stmt-op" @click="gotoStmt(w)">{{ w.stmt ? '📢 查看声明' : '📢 起草声明' }}</button>
         </div>
-        <button class="logbtn" @click="toggleLogs(w)">{{ logId===w.id ? '收起日志' : '📜 日志' }}</button>
+        <button class="logbtn" @click="toggleLogs(w)">{{ logId===w.id ? '收起链路' : '🔗 调度链路' }}</button>
         <div v-if="logId===w.id" class="w-logs">
-          <div v-for="l in logs" :key="l.id" class="wlog">
-            <span class="lg-act" :class="l.action">{{ logText(l.action) }}</span>
+          <div v-if="trace && trace.length" class="trace-hint">
+            🔗 分派/改派/认领 → 通知发送/重试 → 回执/升级 的统一状态流（共 {{ trace.length }} 条）
+          </div>
+          <div v-for="l in trace || logs" :key="(l.kind||'wo')+'-'+l.id" class="wlog" :class="{notify:l.kind==='notify'}">
+            <span class="lg-kind">{{ l.kind === 'notify' ? '📨' : '📋' }}</span>
+            <span class="lg-act" :class="l.action">{{ trace ? traceText(l) : logText(l.action) }}</span>
             <span class="lg-detail">{{ l.detail }}</span>
             <em>{{ l.operator }}{{ l.operator_role ? '·'+roleName(l.operator_role) : '' }} · {{ l.time }}</em>
           </div>
-          <div v-if="!logs.length" class="none">暂无日志</div>
+          <div v-if="!(trace && trace.length) && !logs.length" class="none">暂无日志</div>
+          <!-- 关联通知任务状态 -->
+          <div v-if="deliveryTasks && deliveryTasks.length" class="dlv-tasks">
+            <div v-for="t in deliveryTasks" :key="t.id" class="dtask" :class="t.status">
+              <span class="dt-st">{{ ntStatus(t.status) }}</span>
+              <b>{{ t.channel_name || '渠道#'+t.channel_id }}</b>
+              <span v-if="t.sub_name">{{ t.sub_name }}</span>
+              <em>尝试 {{ t.attempts }}/{{ t.max_attempts }}<template v-if="t.ack_by"> · 回执 {{ t.ack_by }}</template><template v-if="t.escalated_from"> · 升级自 #{{ t.escalated_from }}</template></em>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -108,9 +145,12 @@ const items = ref([])
 const summary = ref({ counts: {} })
 const dict = ref({ status: {}, priority: {}, role: {}, category: {} })
 const filter = ref('')
+const crisisFilter = ref(null)
 const showForm = ref(false)
 const logId = ref(null)
 const logs = ref([])
+const trace = ref(null)
+const deliveryTasks = ref([])
 const nowTick = ref(Date.now()) // SLA 倒计时本地秒针
 
 const form = ref({ crisis_id: null, title: '', detail: '', category: 'other', priority: 'normal', assignee: '', assignee_role: '', sla_min: 60 })
@@ -133,8 +173,35 @@ function gotoStmt(w) {
 function logText(a) {
   return {
     created: '拆分', assigned: '分派', claimed: '认领', started: '开始', blocked: '阻塞',
-    unblocked: '恢复', done: '完成', rework: '回退', cancelled: '取消', escalated: '升级'
+    unblocked: '恢复', done: '完成', rework: '回退', cancelled: '取消', escalated: '升级',
+    notify_sent: '通知送达', notify_retry: '通知重试', notify_failed: '通知失败',
+    notify_acked: '通知回执', notify_escalated: '回执升级', notify_cancelled: '通知取消',
+    notify_paused: '通知暂停', notify_resumed: '通知恢复'
   }[a] || a
+}
+// 统一调度链路：通知侧动作复用通知中心文案
+function traceText(l) {
+  if (l.kind === 'notify') {
+    return {
+      created: '通知生成', sent: '通知送达', retry: '通知重试', failed: '通知失败',
+      paused: '通知暂停', resumed: '通知恢复', acked: '通知回执', escalated: '回执升级', cancelled: '通知取消'
+    }[l.action] || l.action
+  }
+  return logText(l.action)
+}
+function ntStatus(s) {
+  return { pending: '待发送', sent: '已送达', failed: '发送失败', acked: '已回执', escalated: '已升级', paused: '已暂停', cancelled: '已取消' }[s] || s
+}
+function deliveryText(w) {
+  const d = w.delivery
+  const parts = []
+  if (d.acked) parts.push(`回执 ${d.acked}`)
+  if (d.sent) parts.push(`送达 ${d.sent}`)
+  if (d.pending) parts.push(`在途 ${d.pending}`)
+  if (d.escalated) parts.push(`升级 ${d.escalated}`)
+  if (d.failed) parts.push(`失败 ${d.failed}`)
+  if (d.retries) parts.push(`重试 ${d.retries}`)
+  return parts.join(' · ') || d.total + ' 个任务'
 }
 // SLA 文案：阻塞挂起用服务端冻结剩余，其余按本地秒针倒数
 function slaText(w) {
@@ -149,12 +216,23 @@ function slaText(w) {
 }
 
 async function load() {
-  const d = await store.fetchWorkOrders(filter.value ? { status: filter.value } : null)
+  const q2 = {}
+  if (filter.value) q2.status = filter.value
+  if (crisisFilter.value) q2.crisis_id = crisisFilter.value
+  const d = await store.fetchWorkOrders(Object.keys(q2).length ? q2 : null)
   items.value = d.items
   summary.value = d.summary
   dict.value = d.dict
+  // 从危机时间线锚点进入：自动展开对应工单的调度链路
+  if (store.woOpenId) {
+    const targetId = store.woOpenId
+    const target = items.value.find((x) => x.id === targetId)
+    store.woOpenId = null
+    if (target && logId.value !== targetId) await toggleLogs(target)
+  }
 }
 function setFilter(k) { filter.value = k; load() }
+function clearCrisisFilter() { crisisFilter.value = null; store.woFilterCrisis = null; load() }
 
 function openForm() {
   showForm.value = true
@@ -209,17 +287,35 @@ async function cancel(w) {
   await op(w, 'cancel', { note: note.trim() })
 }
 async function toggleLogs(w) {
-  if (logId.value === w.id) { logId.value = null; logs.value = []; return }
+  if (logId.value === w.id) { logId.value = null; logs.value = []; trace.value = null; deliveryTasks.value = []; return }
   const d = await store.fetchWorkOrder(w.id)
   logs.value = d.logs
+  trace.value = d.trace || null
+  deliveryTasks.value = d.workOrder.deliveryTasks || []
   logId.value = w.id
+}
+
+// 链路面板展开时随轮询刷新（通知发送/重试/回执是异步推进的）
+async function refreshOpenTrace() {
+  if (!logId.value) return
+  try {
+    const d = await store.fetchWorkOrder(logId.value)
+    logs.value = d.logs
+    trace.value = d.trace || null
+    deliveryTasks.value = d.workOrder.deliveryTasks || []
+  } catch { /* 瞬时刷新失败忽略 */ }
 }
 
 let timer = null, tick = null
 onMounted(async () => {
+  if (store.woFilterCrisis) crisisFilter.value = store.woFilterCrisis
   await load()
+  store.woFilterCrisis = null
   if (store.woDraftCrisis) openForm()
-  timer = setInterval(load, 4000)
+  timer = setInterval(async () => {
+    await load()
+    await refreshOpenTrace()
+  }, 4000)
   tick = setInterval(() => { nowTick.value = Date.now() }, 1000)
 })
 onUnmounted(() => { clearInterval(timer); clearInterval(tick) })
@@ -238,8 +334,14 @@ onUnmounted(() => { clearInterval(timer); clearInterval(tick) })
 .chip.done.on{border-color:#66bb6a;background:#14261a;}
 .chip.overdue{border-color:rgba(239,83,80,.5);color:#ef9a9a;background:#2c1418;cursor:default;}
 .chip.esc{border-color:rgba(255,152,0,.5);color:#ffcc80;background:#33230e;cursor:default;}
+.chip.ntf{border-color:rgba(66,165,245,.5);color:#90caf9;background:#0d2137;cursor:default;}
+.chip.ntf-fail{border-color:rgba(239,83,80,.5);color:#ef9a9a;background:#2c1418;cursor:default;}
+.chip.ntf-retry{border-color:rgba(255,213,79,.4);color:#ffe082;background:#2e2a12;cursor:default;}
+.chip.ntf-ack{border-color:rgba(38,166,154,.5);color:#80cbc4;background:#0c2622;cursor:default;}
 .me{margin-left:auto;font-size:11px;color:#8ba2c8;background:#13233f;border:1px solid rgba(120,160,220,0.2);border-radius:8px;padding:6px 12px;}
 .hint{margin:0;font-size:11px;color:#5b6f94;line-height:1.5;}
+.filter-bar{display:inline-flex;align-items:center;gap:8px;font-size:11px;color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.35);border-radius:8px;padding:5px 12px;width:fit-content;}
+.clear-filter{background:none;border:1px solid rgba(38,166,154,.4);color:#80cbc4;border-radius:6px;padding:1px 8px;font-size:10px;cursor:pointer;font-family:inherit;}
 .wo-form{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:8px;}
 .no-crisis{font-size:12px;color:#ffab91;background:#3e2723;border:1px solid rgba(255,138,101,.3);border-radius:8px;padding:8px 10px;}
 .row{display:flex;gap:8px;flex-wrap:wrap;}
@@ -280,6 +382,23 @@ textarea{resize:vertical;min-height:52px;}
 .stmt-src{color:#80cbc4;background:#0d2b28;border:1px solid rgba(0,150,136,.3);border-radius:5px;padding:1px 7px;cursor:pointer;}
 .sla{color:#8ba2c8;}
 .sla.over{color:#ef9a9a;font-weight:700;}
+.dlv{font-size:10px;border-radius:5px;padding:1px 7px;}
+.dlv.dispatching{color:#90caf9;background:#0d2137;border:1px solid rgba(144,202,249,.3);}
+.dlv.partial{color:#ffe082;background:#33270e;border:1px solid rgba(255,179,0,.35);}
+.dlv.delivered{color:#a5d6a7;background:#12261a;border:1px solid rgba(102,187,106,.3);}
+.dlv.acked{color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.35);}
+.dlv.stalled{color:#ef9a9a;background:#2c1418;border:1px solid rgba(239,83,80,.4);}
+.dlv.cancelled{color:#78909c;background:#21262c;}
+.w-delivery{display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-top:6px;font-size:10px;}
+.dlv-title{color:#8ba2c8;}
+.d-tag{padding:1px 7px;border-radius:5px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.2);}
+.d-tag.sent{color:#a5d6a7;background:#12261a;border-color:rgba(102,187,106,.3);}
+.d-tag.acked{color:#80cbc4;background:#0c2622;border-color:rgba(38,166,154,.35);}
+.d-tag.esc{color:#ffcc80;background:#3e2723;border-color:rgba(255,152,0,.4);}
+.d-tag.failed{color:#ef9a9a;background:#2c1418;border-color:rgba(239,83,80,.4);}
+.d-tag.paused{color:#b0bec5;background:#263238;}
+.d-tag.cancelled{color:#78909c;background:#21262c;}
+.d-tag.retry{color:#ffe082;background:#33270e;border-color:rgba(255,213,79,.3);}
 .w-blocked{margin-top:6px;font-size:10px;color:#ce93d8;background:#241226;border-radius:6px;padding:4px 8px;}
 .w-result{margin-top:6px;font-size:10px;color:#a5d6a7;background:#12261a;border-radius:6px;padding:4px 8px;}
 .w-result em{color:#80cbc4;font-style:normal;}
@@ -293,11 +412,29 @@ textarea{resize:vertical;min-height:52px;}
 .op.cancel{border-color:rgba(239,83,80,.4);color:#ef5350;}
 .op.stmt-op{border-color:rgba(38,166,154,.55);color:#80cbc4;}
 .logbtn{position:absolute;top:12px;right:12px;background:none;border:1px solid rgba(120,160,220,0.25);color:#8ba2c8;border-radius:7px;padding:3px 9px;font-size:10px;cursor:pointer;font-family:inherit;}
-.w-logs{margin-top:10px;border-top:1px dashed rgba(120,160,220,0.15);padding-top:8px;display:flex;flex-direction:column;gap:5px;max-height:200px;overflow-y:auto;}
+.w-logs{margin-top:10px;border-top:1px dashed rgba(120,160,220,0.15);padding-top:8px;display:flex;flex-direction:column;gap:5px;max-height:240px;overflow-y:auto;}
+.trace-hint{font-size:10px;color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.3);border-radius:6px;padding:4px 8px;margin-bottom:2px;}
 .wlog{display:flex;align-items:baseline;gap:8px;font-size:10px;color:#8ba2c8;}
+.wlog.notify{padding-left:14px;opacity:.92;}
+.lg-kind{flex:none;font-size:10px;}
 .wlog em{margin-left:auto;color:#5b6f94;font-style:normal;white-space:nowrap;}
+.dlv-tasks{display:flex;flex-direction:column;gap:4px;margin-top:6px;border-top:1px dashed rgba(120,160,220,0.12);padding-top:6px;}
+.dtask{display:flex;align-items:center;gap:8px;font-size:10px;color:#8ba2c8;background:#13233f;border-radius:6px;padding:4px 8px;}
+.dtask b{color:#dbe4f3;font-weight:600;}
+.dtask em{margin-left:auto;color:#5b6f94;font-style:normal;}
+.dt-st{flex:none;font-size:9px;padding:1px 7px;border-radius:5px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
+.dtask.sent .dt-st{color:#a5d6a7;background:#12261a;border-color:rgba(102,187,106,.3);}
+.dtask.acked .dt-st{color:#80cbc4;background:#0c2622;border-color:rgba(38,166,154,.35);}
+.dtask.failed .dt-st{color:#ef9a9a;background:#2c1418;border-color:rgba(239,83,80,.4);}
+.dtask.escalated .dt-st{color:#ffcc80;background:#3e2723;border-color:rgba(255,152,0,.4);}
+.dtask.paused .dt-st{color:#b0bec5;background:#263238;}
+.dtask.cancelled .dt-st{color:#78909c;background:#21262c;}
 .lg-act{flex:none;font-size:9px;padding:1px 7px;border-radius:5px;background:#16263f;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .lg-act.escalated,.lg-act.rework{color:#ffab91;border-color:rgba(255,138,101,.35);}
 .lg-act.done{color:#81c784;border-color:rgba(102,187,106,.35);}
 .lg-act.blocked,.lg-act.cancelled{color:#ce93d8;border-color:rgba(171,71,188,.35);}
+.lg-act.notify_acked,.lg-act.notify_sent{color:#80cbc4;border-color:rgba(38,166,154,.35);}
+.lg-act.notify_failed,.lg-act.notify_escalated{color:#ffab91;border-color:rgba(255,138,101,.35);}
+.lg-act.notify_retry{color:#ffe082;border-color:rgba(255,213,79,.3);}
+.lg-act.notify_paused,.lg-act.notify_cancelled,.lg-act.notify_resumed{color:#b0bec5;border-color:rgba(176,190,197,.3);}
 </style>

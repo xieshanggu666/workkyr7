@@ -86,7 +86,9 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   crisis_id INTEGER NOT NULL,
   action TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
-  time TEXT NOT NULL
+  time TEXT NOT NULL,
+  ref_type TEXT NOT NULL DEFAULT '',  -- 链路锚点：workorder/notify（空=普通处置记录）
+  ref_id INTEGER                       -- 锚点对象 id（工单 id 等，看板/复盘可跳转）
 );
 -- 结案档案：每次结案一行，记录联动解除的预警清单与结案前状态，支撑结案回滚精确恢复
 CREATE TABLE IF NOT EXISTS crisis_closures (
@@ -135,10 +137,12 @@ CREATE TABLE IF NOT EXISTS notify_tasks (
   channel_id INTEGER NOT NULL,
   alert_event_id INTEGER,               -- 来源预警触发（回执同步解除用）
   crisis_id INTEGER,                    -- 来源危机事件（回执/升级写时间线）
-  kind TEXT NOT NULL DEFAULT 'alert',   -- alert/crisis
+  kind TEXT NOT NULL DEFAULT 'alert',   -- alert/crisis/workorder/prop
   title TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending', -- pending/sent/failed/acked/escalated/paused/cancelled
+  corr_id TEXT NOT NULL DEFAULT '',    -- 调度链路关联键：同一次分派/升级/改派的多渠道任务共享（跨重试/升级串联）
+  seq INTEGER NOT NULL DEFAULT 0,      -- 关联键内序号：改派/逐级升级递增（同渠道幂等仍以 idem_key 为准）
   attempts INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 3,
   next_retry_at INTEGER,                -- 下次自动重试毫秒时间戳（NULL=立即）
@@ -257,6 +261,8 @@ CREATE TABLE IF NOT EXISTS work_orders (
   status TEXT NOT NULL DEFAULT 'todo',    -- todo/doing/blocked/done/cancelled
   assignee TEXT NOT NULL DEFAULT '',      -- 处理人（空=待分派）
   assignee_role TEXT NOT NULL DEFAULT '', -- 处理人角色（跨角色协同：pr/legal/ops/support/admin）
+  dispatch_seq INTEGER NOT NULL DEFAULT 0,-- 调度链路序号：每次分派/改派 +1（与 notify_tasks.corr_id/seq 串联）
+  dispatch_state TEXT NOT NULL DEFAULT '',-- 通知链路状态：none 未触发 / dispatching 发送中 / partial 部分送达 / delivered 全部送达 / acked 全部回执 / stalled 存在失败
   created_by TEXT NOT NULL DEFAULT '',
   due_at INTEGER,                         -- SLA 截止毫秒时间戳（NULL=无时限）
   escalated INTEGER NOT NULL DEFAULT 0,   -- 超时升级级别：0 未升级 / 1 超时提醒 / 2 升级督办
@@ -282,9 +288,12 @@ CREATE TABLE IF NOT EXISTS work_order_logs (
   detail TEXT NOT NULL DEFAULT '',
   operator TEXT NOT NULL DEFAULT '系统',
   operator_role TEXT NOT NULL DEFAULT '',
-  time TEXT NOT NULL
+  time TEXT NOT NULL,
+  notify_task_id INTEGER,             -- 非空=通知调度链路镜像动作（关联的通知任务）
+  wo_event TEXT NOT NULL DEFAULT ''   -- 链路事件名：created/assigned/reassign/claim/escalate1/escalate2/notify_*
 );
 CREATE INDEX IF NOT EXISTS idx_work_order_logs_wo ON work_order_logs (wo_id, id);
+CREATE INDEX IF NOT EXISTS idx_work_order_logs_task ON work_order_logs (notify_task_id);
 -- ===== 舆情传播路径分析 =====
 -- 传播路径：沉淀一个话题的来源、节点、转发关系与影响阶段（seed/ferment/outbreak/decline）
 CREATE TABLE IF NOT EXISTS prop_paths (
@@ -529,6 +538,105 @@ ensureColumn('crisis_closures', 'report_version', 'report_version INTEGER NOT NU
 ensureColumn('crisis_closures', 'report_title', "report_title TEXT NOT NULL DEFAULT ''")
 // 危机声明关联（工单卡片展示最近一次声明回写的进度）
 ensureColumn('work_orders', 'last_statement_id', 'last_statement_id INTEGER')
+// ===== 协同调度链路升级：工单与通知共享可追踪状态流 =====
+ensureColumn('crisis_timeline', 'ref_type', "ref_type TEXT NOT NULL DEFAULT ''")
+ensureColumn('crisis_timeline', 'ref_id', 'ref_id INTEGER')
+ensureColumn('notify_tasks', 'corr_id', "corr_id TEXT NOT NULL DEFAULT ''")
+ensureColumn('notify_tasks', 'seq', 'seq INTEGER NOT NULL DEFAULT 0')
+ensureColumn('work_orders', 'dispatch_seq', 'dispatch_seq INTEGER NOT NULL DEFAULT 0')
+ensureColumn('work_orders', 'dispatch_state', "dispatch_state TEXT NOT NULL DEFAULT ''")
+ensureColumn('work_order_logs', 'notify_task_id', 'notify_task_id INTEGER')
+ensureColumn('work_order_logs', 'wo_event', "wo_event TEXT NOT NULL DEFAULT ''")
+db.exec('CREATE INDEX IF NOT EXISTS idx_notify_tasks_corr ON notify_tasks (corr_id);')
+db.exec('CREATE INDEX IF NOT EXISTS idx_notify_tasks_wo ON notify_tasks (work_order_id, id);')
+db.exec('CREATE INDEX IF NOT EXISTS idx_work_order_logs_task ON work_order_logs (notify_task_id);')
+db.exec('CREATE INDEX IF NOT EXISTS idx_crisis_timeline_ref ON crisis_timeline (ref_type, ref_id);')
+
+// 历史数据回填（幂等）：为既有工单/通知任务补关联键、升级链回填与链路状态，
+// 让升级前创建的演示数据在新看板/时间线/复盘快照中同样可追踪。
+function migrateDispatchLinks() {
+  // ① 时间线锚点：按既有文案规则回填工单类时间线的 ref 信息
+  const tlRules = [
+    { like: '协同工单 #%', re: /#(\d+)/ },
+    { like: '工单 #%「%', re: /工单 #(\d+)/ },
+    { like: '工单 #%', re: /#(\d+)/ }
+  ]
+  const tlRows = db.prepare("SELECT id, action, note FROM crisis_timeline WHERE ref_type='' AND (note LIKE '协同工单 #%' OR note LIKE '工单 #%')").all()
+  const updRef = db.prepare('UPDATE crisis_timeline SET ref_type=?, ref_id=? WHERE id=?')
+  for (const t of tlRows) {
+    let m = t.note.match(/工单 #(\d+)/) || t.note.match(/协同工单 #(\d+)/) || t.note.match(/#(\d+)/)
+    if (!m) continue
+    const wo = db.prepare('SELECT 1 FROM work_orders WHERE id=?').get(+m[1])
+    if (wo) updRef.run('workorder', +m[1], t.id)
+  }
+  void tlRules
+
+  // ② 通知任务关联键：按工单与既有幂等标签重建 corr_id/seq
+  const ntRows = db.prepare("SELECT id, work_order_id, wo_event, idem_key, escalated_from FROM notify_tasks WHERE work_order_id IS NOT NULL AND corr_id=''").all()
+  const updNt = db.prepare('UPDATE notify_tasks SET corr_id=?, seq=? WHERE id=?')
+  for (const t of ntRows) {
+    const tag = String(t.idem_key || '')
+    let event = 'created', seq = 0
+    if (tag.includes('reassign:')) { event = 'reassign'; const m = tag.match(/reassign:\d+:(\d+)/); seq = m ? +m[1] : 1 }
+    else if (tag.includes('escalate:2')) { event = 'escalate2'; seq = 2 }
+    else if (tag.includes('escalate:1')) { event = 'escalate1'; seq = 1 }
+    else if (t.wo_event === 'created') { event = 'created'; seq = 0 }
+    else if (Number(t.wo_event) === 2) { event = 'escalate2'; seq = 2 }
+    else if (Number(t.wo_event) === 1) { event = 'escalate1'; seq = 1 }
+    updNt.run(`wo${t.work_order_id}:${event}`, seq, t.id)
+  }
+  // ③ 回执升级任务：回填工单归属（升级前任务已携带 work_order_id 的情况）
+  const escRows = db.prepare("SELECT t.id, p.work_order_id FROM notify_tasks t JOIN notify_tasks p ON p.id=t.escalated_from WHERE t.work_order_id IS NULL AND p.work_order_id IS NOT NULL").all()
+  const updWoRef = db.prepare('UPDATE notify_tasks SET work_order_id=?, kind=? WHERE id=?')
+  for (const r of escRows) updWoRef.run(r.work_order_id, 'workorder', r.id)
+  // ④ 升级任务 corr_id 对齐升级级别（无工单的预警升级任务也补统一关联键，便于通知链路追踪）
+  const escNoCorr = db.prepare("SELECT t.id, t.escalated_from, p.corr_id, p.work_order_id FROM notify_tasks t JOIN notify_tasks p ON p.id=t.escalated_from WHERE t.corr_id=''").all()
+  for (const t of escNoCorr) {
+    const corr = t.work_order_id ? `wo${t.work_order_id}:ack_esc:${t.escalated_from}` : `task${t.escalated_from}:ack_esc`
+    updNt.run(corr, 1, t.id)
+  }
+  // ⑤ 工单 dispatch_seq：取改派/升级任务的最大序号
+  const seqRows = db.prepare(`SELECT work_order_id wo_id, MAX(seq) m FROM notify_tasks
+    WHERE work_order_id IS NOT NULL GROUP BY work_order_id`).all()
+  const updWoSeq = db.prepare('UPDATE work_orders SET dispatch_seq=? WHERE id=?')
+  for (const r of seqRows) updWoSeq.run(Math.max(0, r.m || 0), r.wo_id)
+
+  // ⑥ 工单日志事件名回填（按动作映射）
+  const logMap = {
+    created: 'created', assigned: 'assigned', claimed: 'claim', started: '', blocked: '',
+    unblocked: '', done: '', rework: '', cancelled: '', escalated: 'escalate1'
+  }
+  const logRows = db.prepare("SELECT id, action, detail FROM work_order_logs WHERE wo_event=''").all()
+  const updLogEv = db.prepare('UPDATE work_order_logs SET wo_event=? WHERE id=?')
+  for (const l of logRows) {
+    if (l.action === 'escalated' && String(l.detail).includes('二级')) updLogEv.run('escalate2', l.id)
+    else if (logMap[l.action]) updLogEv.run(logMap[l.action], l.id)
+  }
+}
+migrateDispatchLinks()
+
+// 回填工单通知链路状态（依据关联通知任务当前状态聚合；新链路由 workorders.js 实时维护）
+function backfillWorkOrderDispatchState() {
+  const rows = db.prepare(`SELECT work_order_id wo_id,
+      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+      SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) sent,
+      SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
+      SUM(CASE WHEN status='acked' THEN 1 ELSE 0 END) acked,
+      SUM(CASE WHEN status='escalated' THEN 1 ELSE 0 END) esc,
+      SUM(CASE WHEN status='paused' THEN 1 ELSE 0 END) paused,
+      COUNT(*) total
+    FROM notify_tasks WHERE work_order_id IS NOT NULL GROUP BY work_order_id`).all()
+  const upd = db.prepare("UPDATE work_orders SET dispatch_state=? WHERE id=?")
+  for (const r of rows) {
+    let state = 'dispatching'
+    if (r.total > 0 && r.acked === r.total) state = 'acked'
+    else if (r.failed > 0 && r.sent + r.acked === 0) state = 'stalled'
+    else if (r.failed > 0) state = 'partial'
+    else if (r.sent + r.acked === r.total) state = 'delivered'
+    upd.run(state, r.wo_id)
+  }
+}
+backfillWorkOrderDispatchState()
 
 // 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
 // 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。

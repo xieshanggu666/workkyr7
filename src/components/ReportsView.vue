@@ -143,15 +143,18 @@
               </div>
             </section>
 
-            <!-- 工单 -->
+            <!-- 工单（含统一调度链路：分派→发送/重试→回执/升级） -->
             <section class="snap-sec">
-              <h5>📋 协同工单（{{ snap.workOrders.total }} 张 · 在办 {{ snap.workOrders.open }} · 已完成 {{ snap.workOrders.done }}<template v-if="snap.workOrders.overdue"> · 超时 {{ snap.workOrders.overdue }}</template>）</h5>
+              <h5>📋 协同工单（{{ snap.workOrders.total }} 张 · 在办 {{ snap.workOrders.open }} · 已完成 {{ snap.workOrders.done }}<template v-if="snap.workOrders.overdue"> · 超时 {{ snap.workOrders.overdue }}</template><template v-if="snap.workOrders.escalated"> · 已升级 {{ snap.workOrders.escalated }}</template>）</h5>
               <div v-if="!snap.workOrders.total" class="snap-empty">该事件暂无协同工单</div>
               <div v-for="w in snap.workOrders.items" :key="w.id" class="wo-card-snap" :class="w.status">
                 <span class="tag" :class="'st-'+w.status">{{ woText(w.status) }}</span>
                 <b>#{{ w.id }} {{ w.title }}</b>
-                <span>{{ catText(w.category) }} · {{ priText(w.priority) }}</span>
+                <span>{{ catText(w.category) }} · {{ priText(w.priority) }}<template v-if="w.escalated"> · ⬆ {{ w.escalated===2 ? '二级督办' : '一级升级' }}</template></span>
                 <span>处理人 {{ w.assignee ? `${w.assignee}${w.assignee_role ? '·'+teamText(w.assignee_role) : ''}` : '待分派' }}</span>
+                <span v-if="w.delivery && w.delivery.total" class="wo-dlv">
+                  🔗 通知 {{ w.delivery.total }} 渠道<template v-if="w.delivery.sent"> · 送达 {{ w.delivery.sent }}</template><template v-if="w.delivery.acked"> · 回执 {{ w.delivery.acked }}</template><template v-if="w.delivery.pending"> · 在途 {{ w.delivery.pending }}</template><template v-if="w.delivery.escalated"> · 回执升级 {{ w.delivery.escalated }}</template><template v-if="w.delivery.failed"> · 失败 {{ w.delivery.failed }}</template><template v-if="w.delivery.retries"> · 重试 {{ w.delivery.retries }}</template>
+                </span>
                 <span v-if="w.result" class="wo-result">✅ {{ w.result }}</span>
               </div>
             </section>
@@ -176,9 +179,9 @@
               </div>
             </section>
 
-            <!-- 通知回执 -->
+            <!-- 通知回执（与危机看板/工单调度链路同口径） -->
             <section class="snap-sec">
-              <h5>🔔 通知与回执（{{ snap.notifications.total }} 条 · 已回执 {{ snap.notifications.acked }} · 已升级 {{ snap.notifications.escalated }}）</h5>
+              <h5>🔔 通知与回执（{{ snap.notifications.total }} 条 · 已回执 {{ snap.notifications.acked }} · 已升级 {{ snap.notifications.escalated }}<template v-if="snap.notifications.retries"> · 自动重试 {{ snap.notifications.retries }}</template>）</h5>
               <div v-if="!snap.notifications.total" class="snap-empty">该事件暂无通知任务</div>
               <div class="nt-row">
                 <span v-for="(cnt,st) in snap.notifications.byStatus" :key="st" class="nt-pill" :class="st">{{ ntText(st) }} {{ cnt }}</span>
@@ -187,8 +190,9 @@
                 <div v-for="t in snap.notifications.items" :key="t.id" class="snap-item nt">
                   <span class="nt-dot" :class="t.status"></span>
                   <b>{{ t.title }}</b>
-                  <span>{{ t.channel_name }}（{{ t.channel_type }}）</span>
+                  <span>{{ t.channel_name }}（{{ t.channel_type }}）<template v-if="t.work_order_id"> · 📋 工单 #{{ t.work_order_id }}</template><template v-if="t.attempts>1"> · 尝试 {{ t.attempts }}/{{ t.max_attempts }}</template></span>
                   <i class="tag" :class="'st-'+t.status">{{ ntText(t.status) }}</i>
+                  <span v-if="t.escalated_from" class="ack">⬆ 回执超时升级自 #{{ t.escalated_from }}</span>
                   <span v-if="t.ack_by" class="ack">回执：{{ t.ack_by }} · {{ t.ack_at }}<template v-if="t.ack_note">（{{ t.ack_note }}）</template></span>
                   <em>{{ t.sent_at || t.created }}</em>
                 </div>
@@ -502,6 +506,7 @@ input,select,textarea,button{font-family:inherit;}
 .p-stage.outbreak{background:#4a1518;color:#ef9a9a;}.p-stage.decline{background:#263238;color:#b0bec5;}
 .wo-card-snap{display:flex;align-items:center;gap:9px;flex-wrap:wrap;background:#0c1730;border-radius:7px;padding:7px 11px;font-size:11px;color:#aebadd;margin-bottom:5px;}
 .wo-card-snap b{color:#dbe4f3;}
+.wo-dlv{color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.3);border-radius:5px;padding:1px 8px;font-size:10px;}
 .wo-result{color:#81c784;}
 .stmt-snap{background:#0c1a30;border:1px solid rgba(38,166,154,.2);border-left:3px solid #26a69a;border-radius:7px;padding:8px 11px;margin-bottom:6px;display:flex;flex-direction:column;gap:6px;}
 .stmt-snap.review{border-left-color:#ffb300;}.stmt-snap.published{border-left-color:#66bb6a;}.stmt-snap.cancelled{border-left-color:#616161;opacity:.8;}

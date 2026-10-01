@@ -1,5 +1,6 @@
 import { db } from './db.js'
 import { now, addTimeline, LV_TEXT } from './pipeline.js'
+import { mirrorNotifyToWorkOrder, addDispatchTimeline, recomputeWorkOrderState } from './dispatch.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -38,14 +39,20 @@ const subChannels = (s) => safeParse(s.channel_ids, []) || []
 const subLevels = (s) => String(s.levels || '').split(',').map((x) => x.trim()).filter(Boolean)
 
 // 历史追踪：任务全生命周期留痕（操作人缺省为系统/调度器）
+// 同时按动作镜像到关联工单日志，使分派→发送→重试→回执/升级在工单链路中可追踪
 function addLog(taskId, action, detail, operator = '系统') {
   run('INSERT INTO notify_logs (task_id,action,detail,operator,time) VALUES (?,?,?,?,?)',
     taskId, action, detail || '', operator, now())
+  const t = q1('SELECT id, work_order_id, title FROM notify_tasks WHERE id=?', taskId)
+  if (t) {
+    mirrorNotifyToWorkOrder(t, action, detail, operator)
+    if (t.work_order_id) recomputeWorkOrderState(t.work_order_id)
+  }
 }
 
 // ===== 任务生成（订阅匹配 → 多渠道并行任务；幂等键去重，重复触发不产生重复任务） =====
 // opts.kind: alert（预警）/ crisis（危机状态）/ workorder（协同工单事件）/ prop（传播路径事件）
-function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', propPathId = null, idemTag = '', title, content }) {
+function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKey = '', woId = null, woEvent = '', propPathId = null, idemTag = '', corrId = '', corrSeq = 0, title, content }) {
   const created = []
   const ts = now()
   for (const chId of subChannels(sub)) {
@@ -56,11 +63,13 @@ function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKe
       : kind === 'prop' ? `prop:${propPathId}:${idemTag}`
       : `crisis:${crisisId}:${statusKey}`
     const r = run(`INSERT OR IGNORE INTO notify_tasks
-      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,require_ack,work_order_id,wo_event,prop_path_id,created,updated)
-      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?)`,
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,require_ack,work_order_id,wo_event,prop_path_id,corr_id,seq,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,?,?,?,?,?,?,?,?)`,
       `${src}:sub${sub.id}:ch${chId}`, sub.id, chId, alertEventId, crisisId,
       kind === 'workorder' ? 'workorder' : kind, title, content,
-      Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0, woId, woEvent, propPathId, ts, ts)
+      Math.max(1, sub.max_retry || 3), sub.require_ack ? 1 : 0, woId,
+      woEvent === '' || woEvent == null ? '' : String(woEvent), propPathId,
+      corrId || '', corrSeq, ts, ts)
     if (Number(r.changes)) {
       const id = Number(r.lastInsertRowid)
       addLog(id, 'created', `订阅「${sub.name}」匹配，生成通知任务（渠道：${ch.name}）`)
@@ -121,22 +130,35 @@ export function generateForWorkOrder(woId, woEvent, opts = {}) {
   const subEvent = woEvent === 'created' ? 'created' : 'escalated'
   const subs = q(`SELECT * FROM notify_subs WHERE active=1 AND wo_event=?`, subEvent)
   if (!subs.length) return []
-  let title, content, idemTag
+  let title, content, idemTag, corrId, corrSeq = 0
+  const ev = opts.event || ''
   if (subEvent === 'created') {
-    const isReassign = opts.event === 'reassign'
-    title = `【${isReassign ? '工单改派' : '协同工单'}】${w.title}`
-    content = `危机「${w.crisis_title || '#' + w.crisis_id}」${isReassign ? '工单改派' : '拆分工单'} #${w.id} · ${w.assignee ? '处理人：' + w.assignee : '待分派，可认领'} · SLA ${w.due_at ? new Date(w.due_at).toLocaleString('zh-CN') : '无时限'}`
-    // 改派用独立幂等标签，允许再次通知；普通分派每工单每渠道仅一次
-    idemTag = isReassign ? `reassign:${opts.seq || woId}:${opts.to || ''}` : 'created'
+    const isReassign = ev === 'reassign'
+    const isAssign = ev === 'assign'
+    const isClaim = ev === 'claim'
+    const kindText = isReassign ? '工单改派' : isClaim ? '工单认领' : isAssign ? '工单分派' : '协同工单'
+    title = `【${kindText}】${w.title}`
+    const verb = isReassign ? '工单改派' : isClaim ? '工单已认领' : isAssign ? '工单分派' : '拆分工单'
+    content = `危机「${w.crisis_title || '#' + w.crisis_id}」${verb} #${w.id} · ${w.assignee ? '处理人：' + w.assignee : '待分派，可认领'} · SLA ${w.due_at ? new Date(w.due_at).toLocaleString('zh-CN') : '无时限'}`
+    // 分派/改派/认领按「调度轮次 + 处理人」幂等：同一轮重复触发不重发，新一轮流转可再次触达
+    corrSeq = Math.max(0, +opts.seq || 0)
+    idemTag = isReassign ? `reassign:${corrSeq}:${opts.to || w.assignee || ''}`
+      : isClaim ? `claim:${corrSeq}:${opts.to || w.assignee || ''}`
+      : isAssign ? `assign:${corrSeq}:${opts.to || w.assignee || ''}`
+      : 'created'
+    // 分派/改派/认领共享同一关联根 + 轮次序号，通知看板可按链路聚合多次分派
+    corrId = `wo${woId}:dispatch`
   } else {
     // escalated（woEvent=1/2 为升级级别）
     const level = Number(woEvent) || 1
     title = `【工单${level === 2 ? '二级升级督办' : '超时升级'}】${w.title}`
     content = `协同工单 #${w.id} SLA 已到期${level === 2 ? '（一级升级后仍未完成，升级督办至管理员）' : ''} · 处理人：${w.assignee || '待分派'} · 危机「${w.crisis_title || '#' + w.crisis_id}」`
     idemTag = `escalate:${level}`
+    corrId = `wo${woId}:escalate`
+    corrSeq = level
   }
   for (const s of subs) {
-    all.push(...createTasks(s, { kind: 'workorder', woId, woEvent, idemTag, crisisId: w.crisis_id, title, content }))
+    all.push(...createTasks(s, { kind: 'workorder', woId, woEvent, idemTag, corrId, corrSeq, crisisId: w.crisis_id, title, content }))
   }
   return all
 }
@@ -229,16 +251,27 @@ function escalateTask(t) {
     const chId = (sub && sub.escalate_channel_id) || t.channel_id
     const ch = q1('SELECT * FROM notify_channels WHERE id=?', chId)
     addLog(t.id, 'escalated', `回执超时未确认，通知升级至渠道「${ch ? ch.name : '已删除'}」`)
+    // 升级子任务继承来源链路：corr_id 与来源任务同根（无来源关联键时按任务 id 补），
+    // work_order_id 一并继承——工单通知的回执升级同样回到工单调度链路上可追踪
+    const childCorr = t.corr_id
+      ? (/:(escalate|ackEsc)/.test(t.corr_id) ? t.corr_id : `${t.corr_id}:ackEsc`)
+      : (t.work_order_id ? `wo${t.work_order_id}:ackEsc:${t.id}` : `task${t.id}:ackEsc`)
     const cr = run(`INSERT OR IGNORE INTO notify_tasks
-      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,escalated_from,created,updated)
-      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,NULL,?,?,?,?)`,
+      (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,escalated_from,work_order_id,wo_event,corr_id,seq,created,updated)
+      VALUES (?,?,?,?,?,?,?,?,'pending',0,?,NULL,?,?,?,?,?,?,?,?)`,
       `esc:${t.id}:ch${chId}`, t.sub_id, chId, t.alert_event_id, t.crisis_id, t.kind,
-      `【升级】${t.title}`, t.content, Math.max(1, t.max_attempts), t.require_ack, t.id, ts, ts)
-    if (Number(cr.changes)) addLog(Number(cr.lastInsertRowid), 'created', `任务 #${t.id} 回执超时升级生成`)
+      `【升级】${t.title}`, t.content, Math.max(1, t.max_attempts), t.require_ack, t.id,
+      t.work_order_id, t.wo_event, childCorr, (t.seq || 0) + 1, ts, ts)
+    if (Number(cr.changes)) {
+      const childId = Number(cr.lastInsertRowid)
+      addLog(childId, 'created', `任务 #${t.id} 回执超时升级生成`)
+    }
     if (t.crisis_id) {
       const c = q1('SELECT status FROM crisis WHERE id=?', t.crisis_id)
       if (c && c.status !== 'closed') {
-        addTimeline(t.crisis_id, '通知升级', `通知「${t.title}」回执超时未确认，已升级至渠道「${ch ? ch.name : '—'}」`, ts)
+        addDispatchTimeline(t.crisis_id, '通知升级',
+          `通知「${t.title}」回执超时未确认，已升级至渠道「${ch ? ch.name : '—'}」`,
+          { woId: t.work_order_id, refType: t.work_order_id ? 'workorder' : 'notify', refId: t.work_order_id || t.id, time: ts })
       }
     }
     db.exec('COMMIT')
@@ -356,12 +389,13 @@ export function ackTask(id, actor, note = '') {
         crisisId = ev ? ev.crisis_id : null
       }
     }
-    // 回执同步②：危机时间线（已结案事件不再回写，保持结案档案稳定）
+    // 回执同步②：危机时间线（已结案事件不再回写，保持结案档案稳定）；带工单锚点便于看板跳转
     if (crisisId) {
       const c = q1('SELECT status FROM crisis WHERE id=?', crisisId)
       if (c && c.status !== 'closed') {
-        addTimeline(crisisId, '通知回执',
-          `通知「${t.title}」已由 ${actor.user} 确认回执${note ? `：${note}` : ''}${resolved ? '，同步解除关联预警' : ''}`, ts)
+        addDispatchTimeline(crisisId, '通知回执',
+          `通知「${t.title}」已由 ${actor.user} 确认回执${note ? `：${note}` : ''}${resolved ? '，同步解除关联预警' : ''}`,
+          { woId: t.work_order_id, refType: t.work_order_id ? 'workorder' : 'notify', refId: t.work_order_id || t.id, time: ts })
       }
     }
     db.exec('COMMIT')

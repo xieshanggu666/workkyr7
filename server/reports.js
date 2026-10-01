@@ -1,6 +1,7 @@
 import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
 import { ROLE_TEXT } from './notify.js'
+import { deliveryRollup, crisisDispatchSummary } from './dispatch.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -75,41 +76,47 @@ export function buildSnapshot(crisisId) {
     }))
   }
 
-  // ---- 协同工单：状态分布 + SLA 超时 + 处理结果留痕 ----
+  // ---- 协同工单：状态分布 + SLA 超时 + 通知链路（发送/重试/回执/升级）+ 处理结果留痕 ----
   const woRows = q('SELECT * FROM work_orders WHERE crisis_id=? ORDER BY id ASC', crisisId)
   const nowMs = Date.now()
+  const woRollup = deliveryRollup(woRows.map((w) => w.id))
   const workOrders = {
     total: woRows.length,
     open: woRows.filter((w) => ['todo', 'doing', 'blocked'].includes(w.status)).length,
     done: woRows.filter((w) => w.status === 'done').length,
     cancelled: woRows.filter((w) => w.status === 'cancelled').length,
     overdue: woRows.filter((w) => ['todo', 'doing'].includes(w.status) && w.due_at != null && w.due_at < nowMs).length,
+    escalated: woRows.filter((w) => w.escalated > 0 && ['todo', 'doing', 'blocked'].includes(w.status)).length,
     items: woRows.map((w) => ({
       id: w.id, title: w.title, detail: w.detail, category: w.category, priority: w.priority,
       status: w.status, assignee: w.assignee, assignee_role: w.assignee_role,
-      result: w.result, resolve_alerts: w.resolve_alerts, due_at: w.due_at,
+      result: w.result, resolve_alerts: w.resolve_alerts, due_at: w.due_at, escalated: w.escalated,
+      dispatch_seq: w.dispatch_seq, dispatch_state: w.dispatch_state, delivery: woRollup[w.id] || null,
       done_at: w.done_at, created: w.created, prop_path_id: w.prop_path_id
     }))
   }
 
-  // ---- 通知回执：任务状态分布、回执确认与升级记录（计数不受明细窗口限制） ----
+  // ---- 通知回执：任务状态分布、发送重试、回执确认与升级记录（与看板/危机卡片同口径） ----
+  const dispatch = crisisDispatchSummary(crisisId)
   const ntRows = q(`SELECT nt.*, nc.name channel_name, nc.type channel_type
     FROM notify_tasks nt LEFT JOIN notify_channels nc ON nc.id=nt.channel_id
     WHERE nt.crisis_id=? ORDER BY nt.id DESC LIMIT ?`, crisisId, SNAP_TASK_LIMIT)
-  const byStatus = {}
-  for (const t of q('SELECT status, COUNT(*) c FROM notify_tasks WHERE crisis_id=? GROUP BY status', crisisId)) byStatus[t.status] = t.c
   const notifications = {
-    total: Object.values(byStatus).reduce((a, b) => a + b, 0),
-    byStatus,
-    acked: byStatus.acked || 0,
-    escalated: byStatus.escalated || 0,
-    failed: byStatus.failed || 0,
-    pending: (byStatus.pending || 0) + (byStatus.failed || 0),
+    total: dispatch.total,
+    byStatus: dispatch.byStatus,
+    acked: dispatch.acked,
+    escalated: dispatch.escalated,
+    failed: dispatch.failed,
+    pending: dispatch.pending,
+    retries: dispatch.retries,
     items: ntRows.map((t) => ({
       id: t.id, title: t.title, kind: t.kind, status: t.status,
       channel_name: t.channel_name || '已删除渠道', channel_type: t.channel_type,
       require_ack: t.require_ack, ack_by: t.ack_by, ack_at: t.ack_at, ack_note: t.ack_note,
-      escalated: t.escalated, sent_at: t.sent_at, created: t.created
+      escalated: t.escalated, escalated_from: t.escalated_from,
+      work_order_id: t.work_order_id, corr_id: t.corr_id, seq: t.seq,
+      attempts: t.attempts, max_attempts: t.max_attempts, last_error: t.last_error,
+      sent_at: t.sent_at, created: t.created
     }))
   }
 

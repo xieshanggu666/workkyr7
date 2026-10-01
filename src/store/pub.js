@@ -20,6 +20,8 @@ export const usePubStore = defineStore('pub', {
     user: { name: '张岚', role: 'admin' }, // 当前身份（admin 管理员 / ops 值班员 / viewer 观察员）
     tab: 'dash',          // 当前页签（危机卡片可跳转协同工单）
     woDraftCrisis: null,  // 从危机卡片「拆分工单」带入的预填危机 id
+    woFilterCrisis: null, // 从危机卡片「调度链路」角标带入的工单危机过滤
+    woOpenId: null,       // 从危机时间线锚点带入的待展开工单 id
     propCrisisFilter: null, // 从危机卡片跳转传播路径页带入的危机过滤
     reportDraftCrisis: null, // 从危机卡片/回溯跳转复盘报告页：无报告时带危机预填建档
     reportOpenId: null,      // 从危机卡片/回溯跳转复盘报告页：已有报告时自动展开详情

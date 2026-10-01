@@ -19,12 +19,13 @@ import {
 } from './collect.js'
 import {
   WO_STATUS, WO_PRIORITY, WO_ROLE, WO_CATEGORY,
-  listWorkOrders, getWorkOrder, workOrderLogs, workOrderSummary, crisisOpenCount,
+  listWorkOrders, getWorkOrder, workOrderLogs, workOrderSummary, crisisOpenCount, workOrderDispatchTrace,
   createWorkOrder, assignWorkOrder, claimWorkOrder, startWorkOrder,
   blockWorkOrder, completeWorkOrder, reworkWorkOrder, cancelWorkOrder,
   startWorkOrderScheduler, bindWorkOrderNotify
 } from './workorders.js'
 import { generateForWorkOrder, generateForPropEvent, seedPropNotifyTasks } from './notify.js'
+import { crisisDispatchRollup } from './dispatch.js'
 import { bindPipelineProp } from './pipeline.js'
 import {
   PROP_STAGE, NODE_KIND, OUTBREAK_HEAT, KOL_FOLLOWERS,
@@ -63,10 +64,12 @@ startScheduler()
 const resumedCollect = resumeCollectTasks()
 if (resumedCollect) console.log(`[COLLECT] ${resumedCollect} 个采集任务随启动自动接续（游标续采）`)
 startCollectScheduler()
-// 协同工单：注入通知联动钩子（拆分分派/超时升级 → 通知任务），并启动 SLA 两级升级调度
+// 协同工单：注入通知联动钩子（分派/改派/认领/超时升级 → 同一调度链路），并启动 SLA 两级升级调度
 bindWorkOrderNotify({
-  createWorkOrderTasks: (id, opts) => generateForWorkOrder(id, 'created', opts),
-  escalateWorkOrderTasks: (id, level) => generateForWorkOrder(id, level)
+  dispatchTasks: (id, event, opts) => {
+    if (event === 1 || event === 2) return generateForWorkOrder(id, event)
+    return generateForWorkOrder(id, 'created', { event, ...opts })
+  }
 })
 startWorkOrderScheduler()
 // 传播路径分析：注入通知编排/工单/预警管线联动钩子，并为存量爆发期路径补生成通知（幂等）
@@ -96,11 +99,13 @@ function crisisList(withTimeline = false) {
     (SELECT COUNT(*) FROM crisis_statement_channels sc JOIN crisis_statements st ON st.id=sc.statement_id
       WHERE st.crisis_id=c.id AND sc.status='success') stmt_ch_ok
     FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
+  // 调度链路批量汇总（通知发送/回执/升级 + 工单超时/升级，与工单看板、复盘快照同口径）
+  const dispatchMap = crisisDispatchRollup(list.map((c) => c.id))
   return list.map((c) => {
     const rules = q(`SELECT ca.alert_id, ca.is_origin, ca.first_at, ca.last_at, al.title alert_title, al.level alert_level
       FROM crisis_alerts ca LEFT JOIN alerts al ON al.id=ca.alert_id
       WHERE ca.crisis_id=? ORDER BY ca.is_origin DESC, ca.alert_id`, c.id)
-    const item = { ...c, rules }
+    const item = { ...c, rules, dispatch: dispatchMap[c.id] || null }
     item.report = crisisReportBrief(c.id) // 复盘报告状态（编制中/待审核/已发布 + 当前版本）
     item.statement = crisisStatementBrief(c.id) // 最新危机声明状态（危机卡片角标）
     if (withTimeline) item.timeline = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id)
@@ -122,9 +127,14 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM crisis WHERE status!='closed') crisisActive,
     (SELECT COUNT(*) FROM crisis WHERE status='closed') crisisClosed,
     (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen,
+    (SELECT COUNT(*) FROM notify_tasks WHERE status='acked') notifyAcked,
+    (SELECT COUNT(*) FROM notify_tasks WHERE status='escalated') notifyEscalated,
+    (SELECT COUNT(*) FROM notify_logs nl JOIN notify_tasks nt ON nt.id=nl.task_id WHERE nl.action='retry') notifyRetries,
     (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning,
     (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing','blocked')) workOpen,
     (SELECT COUNT(*) FROM work_orders WHERE status IN ('todo','doing') AND due_at IS NOT NULL AND due_at<?) workOverdue,
+    (SELECT COUNT(*) FROM work_orders WHERE escalated>0 AND status IN ('todo','doing','blocked')) workEscalated,
+    (SELECT COUNT(*) FROM work_orders WHERE dispatch_state='stalled') workDispatchStalled,
     (SELECT COUNT(*) FROM prop_paths WHERE stage='outbreak' AND status='active') propOutbreak,
     (SELECT COUNT(*) FROM prop_paths WHERE status='active') propActive,
     (SELECT COUNT(*) FROM crisis_reports WHERE status='draft') reportDraft,
@@ -585,11 +595,11 @@ app.get('/api/work-orders', (req, res) => {
     actor: actorOf(req)
   })
 })
-// 工单详情（含操作日志）
+// 工单详情（含操作日志与统一调度链路：工单动作 + 通知发送/重试/回执归并）
 app.get('/api/work-orders/:id', (req, res) => {
   const w = getWorkOrder(+req.params.id)
   if (!w) return res.status(404).json({ error: '工单不存在' })
-  res.json({ workOrder: w, logs: workOrderLogs(w.id) })
+  res.json({ workOrder: w, logs: workOrderLogs(w.id), trace: workOrderDispatchTrace(w.id) })
 })
 // 从危机拆分工单（ops+）
 app.post('/api/work-orders', guard('ops'), (req, res) => {

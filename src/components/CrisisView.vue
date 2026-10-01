@@ -30,6 +30,9 @@
           <span class="origin" :class="c.origin">{{ c.origin==='auto' ? '🤖 自动建档' : '✍️ 人工建档' }}</span>
           <span v-if="c.open_events" class="open-badge">🔔 未解除预警 {{ c.open_events }}</span>
           <span v-if="c.wo_total" class="wo-badge" :class="{open:c.wo_open}">📋 工单 {{ c.wo_open ? c.wo_open+' 在办 / ' : '' }}{{ c.wo_total }}</span>
+          <span v-if="c.dispatch" class="dispatch-badge" :class="dispatchClass(c.dispatch)" @click="gotoWorkOrder(c)" title="查看该事件的协同工单与通知调度链路">
+            🔗 调度链路<template v-if="c.dispatch.total"> · 通知 {{ c.dispatch.total }}<template v-if="c.dispatch.acked"> / 回执 {{ c.dispatch.acked }}</template><template v-if="c.dispatch.pending"> / 在途 {{ c.dispatch.pending }}</template><template v-if="c.dispatch.failed"> / 失败 {{ c.dispatch.failed }}</template><template v-if="c.dispatch.escalated"> / 回执升级 {{ c.dispatch.escalated }}</template><template v-if="c.dispatch.retries"> · 重试 {{ c.dispatch.retries }}</template></template><template v-if="c.dispatch.woEscalated"> · 工单升级 {{ c.dispatch.woEscalated }}</template><template v-else-if="c.dispatch.woOverdue"> · 工单超时 {{ c.dispatch.woOverdue }}</template>
+          </span>
           <span v-if="c.prop_active" class="prop-badge" :class="{out:c.prop_outbreak}" @click="gotoProp(c)" title="查看关联的传播路径">
             🕸 传播路径 {{ c.prop_active }}{{ c.prop_outbreak ? ' · 🔥爆发 '+c.prop_outbreak : '' }}
           </span>
@@ -69,9 +72,11 @@
           <h5>🕒 处置时间线</h5>
           <div class="tl">
             <div v-for="(t,i) in c.timeline" :key="t.id" class="tl-item">
-              <span class="tl-dot" :class="{latest:i===0}"></span>
+              <span class="tl-dot" :class="{latest:i===0, linked:t.ref_type==='workorder'}"></span>
               <div class="tl-body">
-                <b>{{ t.action }}</b>
+                <b>{{ t.action }}
+                  <span v-if="t.ref_type==='workorder'" class="tl-link" @click.stop="openTimelineWorkOrder(t)">📋 #{{ t.ref_id }} →</span>
+                </b>
                 <span>{{ t.note }}</span>
                 <em>{{ t.time }}</em>
               </div>
@@ -229,6 +234,24 @@ function kindText(k) { return { manual: '手动解除', batch: '批量解除', c
 async function del(c) {
   if (confirm(`删除危机「${c.title}」？`)) await store.delCrisis(c.id)
 }
+// 跳转协同工单页并按该危机过滤
+function gotoWorkOrder(c) {
+  store.woOpenId = null
+  store.woFilterCrisis = c.id
+  store.tab = 'work'
+}
+// 从时间线条目跳转（携带该条目的危机过滤，并自动展开工单调度链路）
+function openTimelineWorkOrder(t) {
+  store.woFilterCrisis = t.crisis_id
+  store.woOpenId = t.ref_id
+  store.tab = 'work'
+}
+function dispatchClass(d) {
+  if (d.woEscalated || d.escalated || d.failed) return 'warn'
+  if (d.acked) return 'acked'
+  if (d.pending || d.sent) return 'active'
+  return ''
+}
 function lvText(x) { return { red: '红', orange: '橙', yellow: '黄' }[x] || x }
 function stText(x) { return { monitoring: '监测中', disposal: '处置中', closed: '已结案' }[x] || x }
 </script>
@@ -257,6 +280,10 @@ textarea{resize:vertical;min-height:52px;}
 .open-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.3);}
 .wo-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .wo-badge.open{background:#132a52;color:#bbdefb;border-color:rgba(66,165,245,.4);}
+.dispatch-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0c2622;color:#80cbc4;border:1px solid rgba(38,166,154,.3);cursor:pointer;}
+.dispatch-badge.active{background:#0d2137;color:#90caf9;border-color:rgba(144,202,249,.3);}
+.dispatch-badge.acked{background:#12261a;color:#a5d6a7;border-color:rgba(102,187,106,.35);}
+.dispatch-badge.warn{background:#3a1a24;color:#ef9a9a;border-color:rgba(239,83,80,.45);}
 .prop-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2b28;color:#80cbc4;border:1px solid rgba(0,150,136,.3);cursor:pointer;}
 .prop-badge.out{background:#3a1a24;color:#ef9a9a;border-color:rgba(239,83,80,.45);}
 .report-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#1f1640;color:#ce93d8;border:1px solid rgba(149,117,205,.35);cursor:pointer;}
@@ -288,6 +315,9 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .tl-item{position:relative;}
 .tl-dot{position:absolute;left:-19px;top:4px;width:9px;height:9px;border-radius:50%;background:#546e7a;}
 .tl-dot.latest{background:#ffd54f;}
+.tl-dot.linked{background:#26a69a;box-shadow:0 0 0 3px rgba(38,166,154,.15);}
+.tl-link{font-size:10px;font-weight:400;color:#80cbc4;background:#0c2622;border:1px solid rgba(38,166,154,.35);border-radius:5px;padding:0 6px;margin-left:6px;cursor:pointer;}
+.tl-link:hover{background:#10433d;}
 .tl-body b{color:#dbe4f3;font-size:12px;display:block;}
 .tl-body span{color:#8ba2c8;font-size:11px;}
 .tl-body em{color:#5b6f94;font-size:10px;font-style:normal;display:block;margin-top:2px;}

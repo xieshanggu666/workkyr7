@@ -1,5 +1,9 @@
 import { db } from './db.js'
-import { now, addTimeline } from './pipeline.js'
+import { now } from './pipeline.js'
+import {
+  logWorkOrder, addDispatchTimeline, deliveryRollup, workOrderDeliveryTasks, workOrderTrace,
+  WO_DISPATCH_STATE_TEXT, cancelWorkOrderDispatch
+} from './dispatch.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -19,12 +23,23 @@ const L2_AFTER_MS = 60000            // 一级升级后 1 分钟仍未处理 →
 const REMIND_COOLDOWN_MS = 30000     // 待分派超时提醒防抖间隔
 
 // 通知联动在 index.js 中注入（避免模块循环依赖：notify ↔ workorders）
-let notifyHooks = { createWorkOrderTasks: null, escalateWorkOrderTasks: null }
+// dispatchTasks(woId, event, opts)：event=created/assign/reassign/claim/1/2；统一走通知调度链路
+let notifyHooks = { dispatchTasks: null }
 export function bindWorkOrderNotify(hooks) { notifyHooks = { ...notifyHooks, ...hooks } }
 
-function addLog(woId, action, detail, actor = { user: '系统', role: '' }) {
-  run('INSERT INTO work_order_logs (wo_id,action,detail,operator,operator_role,time) VALUES (?,?,?,?,?,?)',
-    woId, action, detail || '', actor.user || '系统', actor.assigneeRole || actor.role || '', now())
+function addLog(woId, action, detail, actor = { user: '系统', role: '' }, woEvent = null) {
+  logWorkOrder(woId, action, detail, actor, { woEvent })
+}
+
+// 分派/改派/认领触发通知（失败不影响主流程；携带当前调度轮次 seq 保证幂等口径一致）
+function fireDispatch(woId, event, seq, to) {
+  if (!notifyHooks.dispatchTasks) return
+  try { notifyHooks.dispatchTasks(woId, event, { seq, to }) } catch (e) { console.error('[WORKORDER] 分派通知失败：', e.message) }
+}
+// SLA 超时升级触发通知（一级/二级）
+function fireEscalate(woId, level) {
+  if (!notifyHooks.dispatchTasks) return
+  try { notifyHooks.dispatchTasks(woId, level) } catch (e) { console.error('[WORKORDER] 升级通知失败：', e.message) }
 }
 
 // 危机下未完结工单数（结案守卫/看板汇总）
@@ -41,17 +56,34 @@ export function listWorkOrders({ status = '', crisisId = null, assignee = '', li
   if (assignee) { sql += ' AND assignee=?'; args.push(assignee) }
   sql += ' ORDER BY id DESC LIMIT ?'
   args.push(limit)
-  return q(sql, ...args).map(decorate)
+  const rows = q(sql, ...args).map(decorate)
+  attachDelivery(rows)
+  return rows
+}
+
+// 批量挂载通知链路汇总（一次查询，避免卡片 N+1）
+function attachDelivery(rows) {
+  const rollup = deliveryRollup(rows.map((w) => w.id))
+  for (const w of rows) w.delivery = rollup[w.id] || null
 }
 
 export function getWorkOrder(id) {
   const w = q1(`SELECT w.*, c.title crisis_title, c.status crisis_status, c.level crisis_level
     FROM work_orders w LEFT JOIN crisis c ON c.id=w.crisis_id WHERE w.id=?`, id)
-  return w ? decorate(w) : null
+  if (!w) return null
+  const d = decorate(w)
+  d.delivery = deliveryRollup([id])[id] || null
+  d.deliveryTasks = workOrderDeliveryTasks(id)
+  return d
 }
 
 export function workOrderLogs(id) {
   return q('SELECT * FROM work_order_logs WHERE wo_id=? ORDER BY id ASC', id)
+}
+
+// 工单调度链路视图：工单动作与通知发送/重试/回执归并的统一时间序
+export function workOrderDispatchTrace(id) {
+  return workOrderTrace(id)
 }
 
 function decorate(w) {
@@ -73,6 +105,7 @@ function decorate(w) {
     priorityText: WO_PRIORITY[w.priority] || w.priority,
     categoryText: WO_CATEGORY[w.category] || w.category,
     roleText: WO_ROLE[w.assignee_role] || w.assignee_role || '',
+    dispatchStateText: WO_DISPATCH_STATE_TEXT[w.dispatch_state] || '',
     remainingMs: remaining, overdue,
     stmt
   }
@@ -87,7 +120,28 @@ export function workOrderSummary() {
   const overdue = q1(`SELECT COUNT(*) c FROM work_orders
     WHERE status IN ('todo','doing') AND due_at IS NOT NULL AND due_at<?`, nowMs).c
   const escalated = q1("SELECT COUNT(*) c FROM work_orders WHERE escalated>0 AND status IN ('todo','doing','blocked')").c
-  return { counts, open: counts.todo + counts.doing + counts.blocked, overdue, escalated }
+  // 通知链路汇总（与通知中心、复盘快照同口径；仅统计工单类任务）
+  const nt = q1(`SELECT
+      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+      SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) sent,
+      SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
+      SUM(CASE WHEN status='acked' THEN 1 ELSE 0 END) acked,
+      SUM(CASE WHEN status='escalated' THEN 1 ELSE 0 END) esc,
+      COUNT(*) total
+    FROM notify_tasks WHERE work_order_id IS NOT NULL`)
+  const retries = q1(`SELECT COUNT(*) c FROM notify_logs nl JOIN notify_tasks t ON t.id=nl.task_id
+    WHERE t.work_order_id IS NOT NULL AND nl.action='retry'`).c
+  const dsRows = q("SELECT dispatch_state, COUNT(*) c FROM work_orders WHERE dispatch_state NOT IN ('','none') GROUP BY dispatch_state")
+  const dispatch = { dispatching: 0, stalled: 0, partial: 0, delivered: 0, acked: 0, cancelled: 0 }
+  for (const r of dsRows) dispatch[r.dispatch_state] = r.c
+  return {
+    counts, open: counts.todo + counts.doing + counts.blocked, overdue, escalated,
+    delivery: {
+      total: nt.total || 0, pending: nt.pending || 0, sent: nt.sent || 0,
+      failed: nt.failed || 0, acked: nt.acked || 0, escalated: nt.esc || 0, retries: retries.c
+    },
+    dispatch
+  }
 }
 
 // ===== 创建（从危机拆分） =====
@@ -109,21 +163,21 @@ export function createWorkOrder(body, actor) {
   const propPathId = +b.prop_path_id || null
   const fromProp = propPathId && q1('SELECT 1 FROM prop_paths WHERE id=?', propPathId) ? propPathId : null
   const r = run(`INSERT INTO work_orders
-    (crisis_id,prop_path_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,sla_budget_ms,started_at,created,updated)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    (crisis_id,prop_path_id,title,detail,category,priority,status,assignee,assignee_role,created_by,due_at,sla_budget_ms,started_at,dispatch_seq,dispatch_state,created,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
     crisisId, fromProp, title, String(b.detail || '').trim(), category, priority,
     assignee ? 'doing' : 'todo', assignee, assigneeRole, actor.user, dueAt, slaMin ? slaMin * 60000 : null,
-    assignee ? ts : null, ts, ts)
+    assignee ? ts : null, assignee ? 'dispatching' : 'none', ts, ts)
   const id = Number(r.lastInsertRowid)
-  addLog(id, 'created', `从危机「${c.title}」#${crisisId} 拆分工单（${WO_PRIORITY[priority]} · ${WO_CATEGORY[category]}）${slaMin ? ` · SLA ${slaMin} 分钟` : ' · 无时限'}`, actor)
-  if (assignee) addLog(id, 'assigned', `分派给 ${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）`, actor)
-  addTimeline(crisisId, '工单拆分',
+  addLog(id, 'created', `从危机「${c.title}」#${crisisId} 拆分工单（${WO_PRIORITY[priority]} · ${WO_CATEGORY[category]}）${slaMin ? ` · SLA ${slaMin} 分钟` : ' · 无时限'}`, actor, 'created')
+  if (assignee) addLog(id, 'assigned', `分派给 ${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）`, actor, 'assigned')
+  addDispatchTimeline(crisisId, '工单拆分',
     `拆分协同工单 #${id}「${title}」（${WO_CATEGORY[category]}·${WO_PRIORITY[priority]}）` +
-    (assignee ? `，处理人：${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）` : '，待分派'), ts)
-  // 通知联动：命中「新工单分派」订阅的渠道并发生成通知任务（幂等）
-  if (notifyHooks.createWorkOrderTasks) {
-    try { notifyHooks.createWorkOrderTasks(id) } catch (e) { console.error('[WORKORDER] 分派通知失败：', e.message) }
-  }
+    (assignee ? `，处理人：${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）` : '，待分派'),
+    { woId: id, time: ts })
+  // 通知联动：命中「新工单分派」订阅的渠道并发生成通知任务（同链路 corr_id，幂等）
+  if (assignee) fireDispatch(id, 'created', 0, assignee)
+  else fireDispatch(id, 'created', 0, '')
   return { ok: true, id }
 }
 
@@ -137,18 +191,19 @@ export function assignWorkOrder(id, body, actor) {
   const role = WO_ROLE[body?.assignee_role] ? body.assignee_role : (w.assignee_role || '')
   const ts = now()
   // 待分派单指派后即进入处理中（与创建时指派一致）；处理中/已阻塞改派仅换处理人
+  const isFirstAssign = !w.assignee
+  const seq = (w.dispatch_seq || 0) + (isFirstAssign ? 0 : 1) // 首次分派沿用第 0 轮；改派进入下一轮
   run(`UPDATE work_orders SET assignee=?, assignee_role=?, status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
-    started_at=CASE WHEN status='todo' THEN COALESCE(started_at,?) ELSE started_at END, updated=? WHERE id=?`,
-    assignee, role, ts, ts, id)
-  addLog(id, 'assigned', w.assignee
+    started_at=CASE WHEN status='todo' THEN COALESCE(started_at,?) ELSE started_at END, dispatch_seq=?, updated=? WHERE id=?`,
+    assignee, role, ts, seq, ts, id)
+  const event = isFirstAssign ? 'assign' : 'reassign'
+  addLog(id, isFirstAssign ? 'assigned' : 'assigned', w.assignee
     ? `改派：${w.assignee}（${WO_ROLE[w.assignee_role] || '未指定团队'}）→ ${assignee}（${WO_ROLE[role] || '未指定团队'}）`
-    : `分派给 ${assignee}（${WO_ROLE[role] || '未指定团队'}）`, actor)
-  addTimeline(w.crisis_id, '工单指派', `工单 #${id}「${w.title}」` +
-    (w.assignee ? `改派：${w.assignee} → ${assignee}` : `分派给 ${assignee}`), ts)
-  if (notifyHooks.createWorkOrderTasks) {
-    // 改派通知用新的幂等事件键，保证改派也能触达
-    try { notifyHooks.createWorkOrderTasks(id, { event: 'reassign', seq: w.id, to: assignee }) } catch { /* 通知失败不影响指派 */ }
-  }
+    : `分派给 ${assignee}（${WO_ROLE[role] || '未指定团队'}）`, actor, isFirstAssign ? 'assigned' : 'reassign')
+  addDispatchTimeline(w.crisis_id, isFirstAssign ? '工单指派' : '工单改派', `工单 #${id}「${w.title}」` +
+    (w.assignee ? `改派：${w.assignee} → ${assignee}` : `分派给 ${assignee}`), { woId: id, time: ts })
+  // 分派/改派通知：携带轮次 seq 与新处理人，幂等键按 轮次×处理人 去重
+  fireDispatch(id, event, seq, assignee)
   return { ok: true, workOrder: getWorkOrder(id) }
 }
 
@@ -162,8 +217,9 @@ export function claimWorkOrder(id, actor, reqRole) {
     started_at=COALESCE(started_at,?), updated=? WHERE id=? AND status='todo'`,
     actor.user, mapTeamRole(reqRole), ts, ts, id)
   if (!Number(r.changes)) return { error: '工单状态已变化，请刷新' }
-  addLog(id, 'claimed', `${actor.user} 认领并开始处理`, actor)
-  addTimeline(w.crisis_id, '工单认领', `工单 #${id}「${w.title}」由 ${actor.user} 认领`, ts)
+  addLog(id, 'claimed', `${actor.user} 认领并开始处理`, actor, 'claim')
+  addDispatchTimeline(w.crisis_id, '工单认领', `工单 #${id}「${w.title}」由 ${actor.user} 认领`, { woId: id, time: ts })
+  fireDispatch(id, 'claim', w.dispatch_seq || 0, actor.user)
   return { ok: true, workOrder: getWorkOrder(id) }
 }
 // 平台权限角色 → 职能团队（认领时沿用团队归属）
@@ -182,7 +238,7 @@ export function startWorkOrder(id, actor) {
     if (w.status === 'blocked' && w.paused_at && w.due_at) {
       dueAt = w.due_at + (nowMs - w.paused_at)
       addLog(id, 'unblocked', '解除阻塞恢复处理，SLA 已顺延', actor)
-      addTimeline(w.crisis_id, '工单恢复', `工单 #${id}「${w.title}」解除阻塞恢复处理，SLA 已顺延`, ts)
+      addDispatchTimeline(w.crisis_id, '工单恢复', `工单 #${id}「${w.title}」解除阻塞恢复处理，SLA 已顺延`, { woId: id, time: ts })
     }
     const r = run(`UPDATE work_orders SET status='doing', due_at=?, paused_at=NULL,
       blocked_reason='', started_at=COALESCE(started_at,?), updated=? WHERE id=? AND status IN ('todo','blocked')`,
@@ -209,7 +265,7 @@ export function blockWorkOrder(id, body, actor) {
     reason, Date.now(), ts, id)
   if (!Number(r.changes)) return { error: '工单状态已变化，请刷新' }
   addLog(id, 'blocked', `阻塞挂起：${reason}（SLA 计时暂停）`, actor)
-  addTimeline(w.crisis_id, '工单阻塞', `工单 #${id}「${w.title}」阻塞挂起：${reason}`, ts)
+  addDispatchTimeline(w.crisis_id, '工单阻塞', `工单 #${id}「${w.title}」阻塞挂起：${reason}`, { woId: id, time: ts })
   return { ok: true, workOrder: getWorkOrder(id) }
 }
 
@@ -244,15 +300,18 @@ export function completeWorkOrder(id, body, actor) {
     }
     const c = q1('SELECT status FROM crisis WHERE id=?', w.crisis_id)
     if (c && c.status !== 'closed') {
-      addTimeline(w.crisis_id, '工单完成',
+      addDispatchTimeline(w.crisis_id, '工单完成',
         `协同工单 #${id}「${w.title}」已由 ${w.assignee || actor.user} 完成：${result}` +
-        (resolved ? `（同步解除 ${resolved} 条未解除预警${ruleNames.length ? '：' + ruleNames.join('、') : ''}）` : ''), ts)
+        (resolved ? `（同步解除 ${resolved} 条未解除预警${ruleNames.length ? '：' + ruleNames.join('、') : ''}）` : ''),
+        { woId: id, time: ts })
     }
     db.exec('COMMIT')
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
     throw e
   }
+  // 工单完结：在途（待发送/失败/暂停）分派与升级通知自动取消，避免完结后继续催办
+  cancelWorkOrderDispatch(id, `工单 #${id} 已完成，在途通知自动取消`)
   return { ok: true, resolved, workOrder: getWorkOrder(id) }
 }
 
@@ -270,8 +329,8 @@ export function reworkWorkOrder(id, body, actor) {
   if (!Number(r.changes)) return { error: '工单状态已变化，请刷新' }
   addLog(id, 'rework', (prevDone && w.result ? `打回重做（原结果：${w.result}）` : '回退至处理中') + `：${note}` +
     (assignee !== w.assignee ? `；重新指派给 ${assignee}` : ''), actor)
-  addTimeline(w.crisis_id, '工单回退',
-    `工单 #${id}「${w.title}」被 ${actor.user} 打回重做：${note}` + (assignee !== w.assignee ? `（重新指派：${assignee}）` : ''), ts)
+  addDispatchTimeline(w.crisis_id, '工单回退',
+    `工单 #${id}「${w.title}」被 ${actor.user} 打回重做：${note}` + (assignee !== w.assignee ? `（重新指派：${assignee}）` : ''), { woId: id, time: ts })
   return { ok: true, workOrder: getWorkOrder(id) }
 }
 
@@ -286,7 +345,8 @@ export function cancelWorkOrder(id, body, actor) {
     WHERE id=? AND status IN ('todo','doing','blocked')`, ts, ts, id)
   if (!Number(r.changes)) return { error: '工单状态已变化，请刷新' }
   addLog(id, 'cancelled', note ? `取消：${note}` : '取消工单', actor)
-  addTimeline(w.crisis_id, '工单取消', `工单 #${id}「${w.title}」已取消${note ? `：${note}` : ''}`, ts)
+  addDispatchTimeline(w.crisis_id, '工单取消', `工单 #${id}「${w.title}」已取消${note ? `：${note}` : ''}`, { woId: id, time: ts })
+  cancelWorkOrderDispatch(id, `工单 #${id} 已取消，在途通知自动取消`)
   return { ok: true, workOrder: getWorkOrder(id) }
 }
 
@@ -294,30 +354,31 @@ export function cancelWorkOrder(id, body, actor) {
 function runEscalate(w) {
   const nowMs = Date.now()
   const c = q1('SELECT title,status FROM crisis WHERE id=?', w.crisis_id)
+  const ts = now()
   if (w.escalated === 0) {
     // 一级：待分派 → 分派提醒；处理中 → 超时提醒
-    run('UPDATE work_orders SET escalated=1,last_remind_at=?,updated=? WHERE id=?', nowMs, now(), w.id)
+    run('UPDATE work_orders SET escalated=1,last_remind_at=?,updated=? WHERE id=?', nowMs, ts, w.id)
     const who = w.status === 'todo' ? '工单仍待分派，请尽快认领或指派' : `处理人 ${w.assignee || '—'} 超时未完成`
-    addLog(w.id, 'escalated', `SLA 已到期，一级升级：${who}`, { user: '调度器' })
+    addLog(w.id, 'escalated', `SLA 已到期，一级升级：${who}`, { user: '调度器' }, 'escalate1')
     if (c && c.status !== 'closed') {
-      addTimeline(w.crisis_id, '工单超时', `工单 #${w.id}「${w.title}」SLA 到期，一级升级（${who}）`)
+      addDispatchTimeline(w.crisis_id, '工单超时', `工单 #${w.id}「${w.title}」SLA 到期，一级升级（${who}）`, { woId: w.id, time: ts })
     }
-    notifyHooks.escalateWorkOrderTasks(w.id, 1)
+    fireEscalate(w.id, 1)
     return
   }
   if (w.escalated === 1 && nowMs - (w.last_remind_at || 0) >= L2_AFTER_MS) {
     // 二级：升级督办（值班负责人/管理员）
-    run('UPDATE work_orders SET escalated=2,last_remind_at=?,updated=? WHERE id=?', nowMs, now(), w.id)
-    addLog(w.id, 'escalated', `一级升级后 ${L2_AFTER_MS / 1000} 秒仍未完成，二级升级：升级督办至管理员`, { user: '调度器' })
+    run('UPDATE work_orders SET escalated=2,last_remind_at=?,updated=? WHERE id=?', nowMs, ts, w.id)
+    addLog(w.id, 'escalated', `一级升级后 ${L2_AFTER_MS / 1000} 秒仍未完成，二级升级：升级督办至管理员`, { user: '调度器' }, 'escalate2')
     if (c && c.status !== 'closed') {
-      addTimeline(w.crisis_id, '工单升级', `工单 #${w.id}「${w.title}」持续超时，二级升级督办（管理员介入）`)
+      addDispatchTimeline(w.crisis_id, '工单升级', `工单 #${w.id}「${w.title}」持续超时，二级升级督办（管理员介入）`, { woId: w.id, time: ts })
     }
-    notifyHooks.escalateWorkOrderTasks(w.id, 2)
+    fireEscalate(w.id, 2)
   }
 }
 
 export function runWorkOrderTick() {
-  if (!notifyHooks.escalateWorkOrderTasks) return // 通知钩子未注入前不扫描
+  if (!notifyHooks.dispatchTasks) return // 通知钩子未注入前不扫描
   const nowMs = Date.now()
   const due = q(`SELECT * FROM work_orders WHERE status IN ('todo','doing')
     AND due_at IS NOT NULL AND due_at<=? AND escalated<2 ORDER BY due_at LIMIT ?`, nowMs, DUE_BATCH)
