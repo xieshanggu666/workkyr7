@@ -1,5 +1,6 @@
 import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
+import { trace } from './dispatch.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -116,7 +117,11 @@ export function createWorkOrder(body, actor) {
     assignee ? ts : null, ts, ts)
   const id = Number(r.lastInsertRowid)
   addLog(id, 'created', `从危机「${c.title}」#${crisisId} 拆分工单（${WO_PRIORITY[priority]} · ${WO_CATEGORY[category]}）${slaMin ? ` · SLA ${slaMin} 分钟` : ' · 无时限'}`, actor)
-  if (assignee) addLog(id, 'assigned', `分派给 ${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）`, actor)
+  if (assignee) {
+    addLog(id, 'assigned', `分派给 ${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）`, actor)
+    // 调度链：创建即分派（与指派接口同口径）
+    trace({ crisisId, kind: 'wo', action: 'assign', refId: id, woId: id, title, actor: actor.user, detail: `分派给 ${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）` })
+  }
   addTimeline(crisisId, '工单拆分',
     `拆分协同工单 #${id}「${title}」（${WO_CATEGORY[category]}·${WO_PRIORITY[priority]}）` +
     (assignee ? `，处理人：${assignee}（${WO_ROLE[assigneeRole] || '未指定团队'}）` : '，待分派'), ts)
@@ -140,9 +145,16 @@ export function assignWorkOrder(id, body, actor) {
   run(`UPDATE work_orders SET assignee=?, assignee_role=?, status=CASE WHEN status='todo' THEN 'doing' ELSE status END,
     started_at=CASE WHEN status='todo' THEN COALESCE(started_at,?) ELSE started_at END, updated=? WHERE id=?`,
     assignee, role, ts, ts, id)
-  addLog(id, 'assigned', w.assignee
+  const isReassign = !!w.assignee
+  addLog(id, 'assigned', isReassign
     ? `改派：${w.assignee}（${WO_ROLE[w.assignee_role] || '未指定团队'}）→ ${assignee}（${WO_ROLE[role] || '未指定团队'}）`
     : `分派给 ${assignee}（${WO_ROLE[role] || '未指定团队'}）`, actor)
+  // 调度链：分派/改派统一事件（改派独立动作，复盘统计按此拆分口径）
+  trace({
+    crisisId: w.crisis_id, kind: 'wo', action: isReassign ? 'reassign' : 'assign', refId: id, woId: id,
+    title: w.title, actor: actor.user,
+    detail: isReassign ? `改派：${w.assignee} → ${assignee}（${WO_ROLE[role] || '未指定团队'}）` : `分派给 ${assignee}（${WO_ROLE[role] || '未指定团队'}）`
+  })
   addTimeline(w.crisis_id, '工单指派', `工单 #${id}「${w.title}」` +
     (w.assignee ? `改派：${w.assignee} → ${assignee}` : `分派给 ${assignee}`), ts)
   if (notifyHooks.createWorkOrderTasks) {
@@ -163,6 +175,7 @@ export function claimWorkOrder(id, actor, reqRole) {
     actor.user, mapTeamRole(reqRole), ts, ts, id)
   if (!Number(r.changes)) return { error: '工单状态已变化，请刷新' }
   addLog(id, 'claimed', `${actor.user} 认领并开始处理`, actor)
+  trace({ crisisId: w.crisis_id, kind: 'wo', action: 'claim', refId: id, woId: id, title: w.title, actor: actor.user, detail: `${actor.user} 认领并开始处理` })
   addTimeline(w.crisis_id, '工单认领', `工单 #${id}「${w.title}」由 ${actor.user} 认领`, ts)
   return { ok: true, workOrder: getWorkOrder(id) }
 }
@@ -299,6 +312,7 @@ function runEscalate(w) {
     run('UPDATE work_orders SET escalated=1,last_remind_at=?,updated=? WHERE id=?', nowMs, now(), w.id)
     const who = w.status === 'todo' ? '工单仍待分派，请尽快认领或指派' : `处理人 ${w.assignee || '—'} 超时未完成`
     addLog(w.id, 'escalated', `SLA 已到期，一级升级：${who}`, { user: '调度器' })
+    trace({ crisisId: w.crisis_id, kind: 'wo', action: 'wo_escalate1', refId: w.id, woId: w.id, title: w.title, actor: '调度器', detail: `SLA 已到期，一级升级：${who}` })
     if (c && c.status !== 'closed') {
       addTimeline(w.crisis_id, '工单超时', `工单 #${w.id}「${w.title}」SLA 到期，一级升级（${who}）`)
     }
@@ -309,6 +323,7 @@ function runEscalate(w) {
     // 二级：升级督办（值班负责人/管理员）
     run('UPDATE work_orders SET escalated=2,last_remind_at=?,updated=? WHERE id=?', nowMs, now(), w.id)
     addLog(w.id, 'escalated', `一级升级后 ${L2_AFTER_MS / 1000} 秒仍未完成，二级升级：升级督办至管理员`, { user: '调度器' })
+    trace({ crisisId: w.crisis_id, kind: 'wo', action: 'wo_escalate2', refId: w.id, woId: w.id, title: w.title, actor: '调度器', detail: `一级升级后 ${L2_AFTER_MS / 1000} 秒仍未完成，二级升级督办至管理员` })
     if (c && c.status !== 'closed') {
       addTimeline(w.crisis_id, '工单升级', `工单 #${w.id}「${w.title}」持续超时，二级升级督办（管理员介入）`)
     }

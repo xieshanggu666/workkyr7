@@ -1,5 +1,6 @@
 import { db } from './db.js'
 import { now, addTimeline, LV_TEXT } from './pipeline.js'
+import { trace } from './dispatch.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -64,6 +65,8 @@ function createTasks(sub, { kind, alertEventId = null, crisisId = null, statusKe
     if (Number(r.changes)) {
       const id = Number(r.lastInsertRowid)
       addLog(id, 'created', `订阅「${sub.name}」匹配，生成通知任务（渠道：${ch.name}）`)
+      // 调度链：通知生成（工单来源任务带 woId，可回溯到分派/升级来源）
+      trace({ crisisId, kind: 'notify', action: 'notify_created', refId: id, woId, title, actor: '调度器', detail: `订阅「${sub.name}」生成通知任务（渠道：${ch.name}）` })
       created.push(id)
     }
   }
@@ -214,6 +217,12 @@ function attemptSend(t) {
       addLog(t.id, giveUp ? 'failed' : 'retry', giveUp
         ? `第 ${attempt} 次发送失败，已达重试上限（${t.max_attempts} 次）：${msg}，可手动重试`
         : `第 ${attempt} 次发送失败：${msg}，${(RETRY_BASE_MS * attempt) / 1000} 秒后自动重试`)
+      // 调度链：自动重试 / 发送失败（复盘统计重试与失败口径同源）
+      trace({
+        crisisId: t.crisis_id, kind: 'notify', action: giveUp ? 'send_failed' : 'retry', refId: t.id,
+        woId: t.work_order_id || null, title: t.title, actor: '调度器',
+        detail: giveUp ? `第 ${attempt} 次发送失败，已达重试上限：${msg}` : `第 ${attempt} 次发送失败：${msg}，${(RETRY_BASE_MS * attempt) / 1000} 秒后自动重试`
+      })
     }
   }
 }
@@ -229,12 +238,19 @@ function escalateTask(t) {
     const chId = (sub && sub.escalate_channel_id) || t.channel_id
     const ch = q1('SELECT * FROM notify_channels WHERE id=?', chId)
     addLog(t.id, 'escalated', `回执超时未确认，通知升级至渠道「${ch ? ch.name : '已删除'}」`)
+    // 调度链：回执超时升级
+    trace({ crisisId: t.crisis_id, kind: 'notify', action: 'ack_escalate', refId: t.id, woId: t.work_order_id || null, title: t.title, actor: '调度器', detail: `回执超时未确认，通知升级至渠道「${ch ? ch.name : '已删除'}」` })
     const cr = run(`INSERT OR IGNORE INTO notify_tasks
       (idem_key,sub_id,channel_id,alert_event_id,crisis_id,kind,title,content,status,attempts,max_attempts,next_retry_at,require_ack,escalated_from,created,updated)
       VALUES (?,?,?,?,?,?,?,?,'pending',0,?,NULL,?,?,?,?)`,
       `esc:${t.id}:ch${chId}`, t.sub_id, chId, t.alert_event_id, t.crisis_id, t.kind,
       `【升级】${t.title}`, t.content, Math.max(1, t.max_attempts), t.require_ack, t.id, ts, ts)
-    if (Number(cr.changes)) addLog(Number(cr.lastInsertRowid), 'created', `任务 #${t.id} 回执超时升级生成`)
+    if (Number(cr.changes)) {
+      const escId = Number(cr.lastInsertRowid)
+      addLog(escId, 'created', `任务 #${t.id} 回执超时升级生成`)
+      // 调度链：升级任务同样进入通知生成口径（其后续发送/回执照常追踪）
+      trace({ crisisId: t.crisis_id, kind: 'notify', action: 'notify_created', refId: escId, woId: t.work_order_id || null, title: `【升级】${t.title}`, actor: '调度器', detail: `任务 #${t.id} 回执超时升级生成` })
+    }
     if (t.crisis_id) {
       const c = q1('SELECT status FROM crisis WHERE id=?', t.crisis_id)
       if (c && c.status !== 'closed') {
@@ -316,7 +332,11 @@ export function retryTask(id, actor) {
   if (!t) return null
   if (t.status !== 'failed') return { error: '仅发送失败的任务可手动重试', task: getTask(id) }
   const r = run(`UPDATE notify_tasks SET status='pending', attempts=0, next_retry_at=NULL, last_error='', updated=? WHERE id=? AND status='failed'`, now(), id)
-  if (Number(r.changes)) addLog(id, 'retry', '手动重试：重置发送计数，重新进入发送队列', actor.user)
+  if (Number(r.changes)) {
+    addLog(id, 'retry', '手动重试：重置发送计数，重新进入发送队列', actor.user)
+    // 调度链：手动重试（与自动重试分列口径）
+    trace({ crisisId: t.crisis_id, kind: 'notify', action: 'manual_retry', refId: id, woId: t.work_order_id || null, title: t.title, actor: actor.user, detail: '手动重试：重置发送计数，重新进入发送队列' })
+  }
   return { ok: true, task: getTask(id) }
 }
 
@@ -356,6 +376,8 @@ export function ackTask(id, actor, note = '') {
         crisisId = ev ? ev.crisis_id : null
       }
     }
+    // 调度链：回执确认（crisisId 可能来自关联预警触发记录回填）
+    trace({ crisisId, kind: 'notify', action: 'ack', refId: id, woId: t.work_order_id || null, title: t.title, actor: actor.user, detail: note ? `确认回执：${note}` : '确认回执' })
     // 回执同步②：危机时间线（已结案事件不再回写，保持结案档案稳定）
     if (crisisId) {
       const c = q1('SELECT status FROM crisis WHERE id=?', crisisId)

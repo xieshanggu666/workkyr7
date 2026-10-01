@@ -12,7 +12,7 @@
       </div>
       <span class="me">👤 {{ store.user.name }} · {{ roleText(store.user.role) }}</span>
     </div>
-    <p class="hint">🔗 从危机拆分跨角色协同工单：分派/认领 → 处理（可阻塞挂起 SLA）→ 完成回写危机时间线（可联动解除预警）；SLA 超时两级升级并联动通知调度；结案须先完结全部工单。</p>
+    <p class="hint">🔗 从危机拆分跨角色协同工单：分派/认领 → 处理（可阻塞挂起 SLA）→ 完成回写危机时间线（可联动解除预警）；SLA 超时两级升级并联动通知调度；分派/改派/升级/回执/重试全程写入统一调度链（日志下方可溯）；结案须先完结全部工单。</p>
 
     <!-- 拆分工单表单 -->
     <form v-if="showForm" class="wo-form" @submit.prevent="create">
@@ -93,6 +93,15 @@
             <em>{{ l.operator }}{{ l.operator_role ? '·'+roleName(l.operator_role) : '' }} · {{ l.time }}</em>
           </div>
           <div v-if="!logs.length" class="none">暂无日志</div>
+          <!-- 调度链：分派/改派/超时升级 → 通知生成/重试 → 回执（与危机看板、复盘统计同源） -->
+          <template v-if="dispatch.length">
+            <div class="wd-head">🔗 调度链（分派/升级 → 通知 → 回执/重试）</div>
+            <div v-for="e in dispatch" :key="'dp'+e.id" class="wlog">
+              <span class="lg-act" :class="'dp-'+e.kind">{{ e.kind==='wo' ? '📋' : '🔔' }} {{ e.actionText }}</span>
+              <span class="lg-detail">{{ e.detail }}</span>
+              <em>{{ e.actor }} · {{ e.time }}</em>
+            </div>
+          </template>
         </div>
       </div>
     </div>
@@ -111,6 +120,7 @@ const filter = ref('')
 const showForm = ref(false)
 const logId = ref(null)
 const logs = ref([])
+const dispatch = ref([]) // 当前展开工单的调度链事件（分派→通知→回执）
 const nowTick = ref(Date.now()) // SLA 倒计时本地秒针
 
 const form = ref({ crisis_id: null, title: '', detail: '', category: 'other', priority: 'normal', assignee: '', assignee_role: '', sla_min: 60 })
@@ -209,9 +219,10 @@ async function cancel(w) {
   await op(w, 'cancel', { note: note.trim() })
 }
 async function toggleLogs(w) {
-  if (logId.value === w.id) { logId.value = null; logs.value = []; return }
+  if (logId.value === w.id) { logId.value = null; logs.value = []; dispatch.value = []; return }
   const d = await store.fetchWorkOrder(w.id)
   logs.value = d.logs
+  dispatch.value = d.dispatch || []
   logId.value = w.id
 }
 
@@ -300,4 +311,7 @@ textarea{resize:vertical;min-height:52px;}
 .lg-act.escalated,.lg-act.rework{color:#ffab91;border-color:rgba(255,138,101,.35);}
 .lg-act.done{color:#81c784;border-color:rgba(102,187,106,.35);}
 .lg-act.blocked,.lg-act.cancelled{color:#ce93d8;border-color:rgba(171,71,188,.35);}
+.wd-head{margin-top:8px;padding-top:8px;border-top:1px dashed rgba(120,160,220,0.15);font-size:10px;color:#80d8ff;font-weight:600;}
+.lg-act.dp-wo{color:#90caf9;border-color:rgba(144,202,249,.35);background:#0d2137;}
+.lg-act.dp-notify{color:#80d8ff;border-color:rgba(77,208,225,.35);background:#132a3e;}
 </style>

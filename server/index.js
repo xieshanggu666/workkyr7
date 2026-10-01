@@ -44,6 +44,7 @@ import {
   startPublishing, registerChannel, retryChannel, cancelChannel, cancelStatement,
   deleteStatementsOfCrisis
 } from './statements.js'
+import { crisisDispatch, dispatchBoard, workOrderDispatch } from './dispatch.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -81,12 +82,15 @@ if (seededProp) console.log(`[PROP] 为存量爆发期传播路径生成 ${seede
 const seededReportSnap = ensureSeedSnapshots()
 if (seededReportSnap) console.log(`[REPORT] 为 ${seededReportSnap} 份复盘报告补齐聚合快照`)
 
-// 危机列表（含来源规则、承接规则、未解除预警数、协同工单统计、时间线）
+// 危机列表（含来源规则、承接规则、未解除预警数、协同工单统计、调度链角标、时间线）
 function crisisList(withTimeline = false) {
   const list = q(`SELECT c.*, a.title alert_title,
     (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events,
     (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id AND wo.status IN ('todo','doing','blocked')) wo_open,
     (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id) wo_total,
+    (SELECT COUNT(*) FROM work_orders wo WHERE wo.crisis_id=c.id AND wo.escalated>0 AND wo.status IN ('todo','doing','blocked')) wo_esc,
+    (SELECT COUNT(*) FROM notify_tasks nt WHERE nt.crisis_id=c.id AND nt.require_ack=1 AND nt.status IN ('sent','escalated')) nt_ack,
+    (SELECT COUNT(*) FROM notify_tasks nt WHERE nt.crisis_id=c.id AND (nt.status='failed' OR (nt.status='pending' AND nt.next_retry_at IS NOT NULL))) nt_retry,
     (SELECT COUNT(*) FROM prop_paths pp WHERE pp.crisis_id=c.id AND pp.status='active') prop_active,
     (SELECT COUNT(*) FROM prop_paths pp WHERE pp.crisis_id=c.id AND pp.stage='outbreak' AND pp.status='active') prop_outbreak,
     (SELECT COUNT(*) FROM crisis_statements st WHERE st.crisis_id=c.id AND st.status IN ('draft','review','approved','publishing')) stmt_open,
@@ -134,6 +138,8 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM crisis_statements WHERE status='publishing') stmtPublishing,
     (SELECT COUNT(*) FROM crisis_statement_channels WHERE status IN ('pending','publishing')) stmtChannelOpen,
     (SELECT COUNT(*) FROM crisis_statement_channels WHERE status='failed') stmtChannelFailed`, Date.now())
+  // 协同调度链全局指标：已升级工单 / 待回执通知 / 重试中通知（与危机卡片角标、复盘统计同源）
+  const dispatch = dispatchBoard()
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -146,7 +152,7 @@ app.get('/api/state', (req, res) => {
   }
   res.json({
     sources, hotWords: hot, activeAlerts, crises,
-    stats: { ...statsSummary(posts), ...loop },
+    stats: { ...statsSummary(posts), ...loop, ...dispatch },
     trend
   })
 })
@@ -444,8 +450,10 @@ app.get('/api/crisis/:id/review', (req, res) => {
   // 复盘报告回写状态（统计口径同源：已发布版本回写结案档案）
   const reportRow = q1('SELECT id,title,status,current_version,published_version,reviewed_by,published_at FROM crisis_reports WHERE crisis_id=? ORDER BY id DESC LIMIT 1', c.id)
   const report = reportRow ? { ...reportRow, statusText: REPORT_STATUS[reportRow.status] || reportRow.status } : null
+  // 协同调度链：分派/改派/认领/超时升级/通知重试/回执 统一事件流聚合（与看板角标、复盘快照同源）
+  const dispatch = crisisDispatch(c.id)
   res.json({
-    crisis: c, timeline, events, rules, closures, report,
+    crisis: c, timeline, events, rules, closures, report, dispatch,
     stats: {
       triggers: events.length,
       open,
@@ -585,11 +593,11 @@ app.get('/api/work-orders', (req, res) => {
     actor: actorOf(req)
   })
 })
-// 工单详情（含操作日志）
+// 工单详情（含操作日志与调度链：分派/改派/升级 → 通知生成/重试 → 回执 全程可溯）
 app.get('/api/work-orders/:id', (req, res) => {
   const w = getWorkOrder(+req.params.id)
   if (!w) return res.status(404).json({ error: '工单不存在' })
-  res.json({ workOrder: w, logs: workOrderLogs(w.id) })
+  res.json({ workOrder: w, logs: workOrderLogs(w.id), dispatch: workOrderDispatch(w.id) })
 })
 // 从危机拆分工单（ops+）
 app.post('/api/work-orders', guard('ops'), (req, res) => {

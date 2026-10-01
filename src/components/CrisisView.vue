@@ -30,6 +30,9 @@
           <span class="origin" :class="c.origin">{{ c.origin==='auto' ? '🤖 自动建档' : '✍️ 人工建档' }}</span>
           <span v-if="c.open_events" class="open-badge">🔔 未解除预警 {{ c.open_events }}</span>
           <span v-if="c.wo_total" class="wo-badge" :class="{open:c.wo_open}">📋 工单 {{ c.wo_open ? c.wo_open+' 在办 / ' : '' }}{{ c.wo_total }}</span>
+          <span v-if="c.wo_esc" class="dp-badge esc" title="SLA 超时已升级的未完结工单">⬆ 升级中 {{ c.wo_esc }}</span>
+          <span v-if="c.nt_ack" class="dp-badge ack" title="已发送待确认回执的通知">📨 待回执 {{ c.nt_ack }}</span>
+          <span v-if="c.nt_retry" class="dp-badge retry" title="退避重试中 / 发送失败待手动重试的通知">↻ 重试中 {{ c.nt_retry }}</span>
           <span v-if="c.prop_active" class="prop-badge" :class="{out:c.prop_outbreak}" @click="gotoProp(c)" title="查看关联的传播路径">
             🕸 传播路径 {{ c.prop_active }}{{ c.prop_outbreak ? ' · 🔥爆发 '+c.prop_outbreak : '' }}
           </span>
@@ -96,6 +99,27 @@
               <i class="rd"></i>{{ r.alert_title }}<em v-if="r.is_origin" class="origin-tag">来源</em>
               <b>{{ r.open ? r.open+' 待处置 · ' : '' }}{{ r.triggers }} 次</b>
             </span>
+          </div>
+
+          <!-- 协同调度链：分派/改派/超时升级/重试/回执 统一事件流聚合（与看板角标、复盘统计同源） -->
+          <div v-if="review.dispatch" class="rv-dispatch">
+            <div class="rd-head">
+              🔗 协同调度链
+              <span v-if="review.dispatch.woEscalated" class="rd-live esc">⬆ 升级中 {{ review.dispatch.woEscalated }}</span>
+              <span v-if="review.dispatch.ackPending" class="rd-live ack">📨 待回执 {{ review.dispatch.ackPending }}</span>
+              <span v-if="review.dispatch.retrying" class="rd-live retry">↻ 重试中 {{ review.dispatch.retrying }}</span>
+            </div>
+            <div class="rd-stats">
+              <span>分派 <b>{{ review.dispatch.wo.assign }}</b></span>
+              <span>改派 <b>{{ review.dispatch.wo.reassign }}</b></span>
+              <span>认领 <b>{{ review.dispatch.wo.claim }}</b></span>
+              <span>超时升级 <b class="warn">{{ review.dispatch.wo.escalate1 + review.dispatch.wo.escalate2 }}</b></span>
+              <span>通知重试 <b>{{ review.dispatch.notify.retry + review.dispatch.notify.manualRetry }}</b></span>
+              <span>回执 <b class="ok">{{ review.dispatch.notify.ack }}</b></span>
+              <span>回执超时升级 <b class="warn">{{ review.dispatch.notify.ackEscalate }}</b></span>
+              <span v-if="review.dispatch.ackQuality.ackRate != null">回执率 <b class="ok">{{ review.dispatch.ackQuality.ackRate }}%</b></span>
+              <span v-if="review.dispatch.ackQuality.avgAckMin != null">平均回执 <b>{{ review.dispatch.ackQuality.avgAckMin }} 分钟</b></span>
+            </div>
           </div>
           <div v-if="review.events.length" class="rv-events">
             <div v-for="e in review.events" :key="e.id" class="rv-ev" :class="{resolved:e.status==='resolved'}">
@@ -257,6 +281,10 @@ textarea{resize:vertical;min-height:52px;}
 .open-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.3);}
 .wo-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.25);}
 .wo-badge.open{background:#132a52;color:#bbdefb;border-color:rgba(66,165,245,.4);}
+.dp-badge{font-size:10px;padding:2px 8px;border-radius:6px;}
+.dp-badge.esc{background:#3e2723;color:#ffab91;border:1px solid rgba(255,138,101,.35);}
+.dp-badge.ack{background:#132a3e;color:#80d8ff;border:1px solid rgba(77,208,225,.35);}
+.dp-badge.retry{background:#33270e;color:#ffe082;border:1px solid rgba(255,179,0,.35);}
 .prop-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#0d2b28;color:#80cbc4;border:1px solid rgba(0,150,136,.3);cursor:pointer;}
 .prop-badge.out{background:#3a1a24;color:#ef9a9a;border-color:rgba(239,83,80,.45);}
 .report-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:#1f1640;color:#ce93d8;border:1px solid rgba(149,117,205,.35);cursor:pointer;}
@@ -327,6 +355,16 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .rv-report.published{border-left-color:#66bb6a;}.rv-report.reviewing{border-left-color:#ffa726;}
 .mini-link{margin-left:auto;background:none;border:none;color:#90caf9;font-size:11px;cursor:pointer;text-decoration:underline;}
 .rv-none{color:#5b6f94;font-size:11px;text-align:center;padding:8px 0;}
+.rv-dispatch{background:#0d1f3c;border:1px solid rgba(66,165,245,.25);border-radius:8px;padding:8px 11px;margin-bottom:10px;}
+.rd-head{font-size:11px;color:#90caf9;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;}
+.rd-live{font-size:9px;font-weight:400;padding:1px 7px;border-radius:5px;}
+.rd-live.esc{background:#3e2723;color:#ffab91;}
+.rd-live.ack{background:#132a3e;color:#80d8ff;}
+.rd-live.retry{background:#33270e;color:#ffe082;}
+.rd-stats{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;color:#8ba2c8;}
+.rd-stats b{color:#fff;font-weight:600;margin-left:2px;}
+.rd-stats b.warn{color:#ffab91;}
+.rd-stats b.ok{color:#a5d6a7;}
 .close-box{border-top:1px dashed rgba(120,160,220,0.15);padding-top:10px;display:flex;flex-direction:column;gap:8px;}
 .close-box textarea{min-height:56px;}
 .close-row{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;}

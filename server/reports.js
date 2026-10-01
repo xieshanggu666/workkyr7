@@ -1,6 +1,7 @@
 import { db } from './db.js'
 import { now, addTimeline } from './pipeline.js'
 import { ROLE_TEXT } from './notify.js'
+import { crisisDispatch } from './dispatch.js'
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
@@ -120,6 +121,10 @@ export function buildSnapshot(crisisId) {
     report_id: cl.report_id, report_version: cl.report_version, report_title: cl.report_title
   }))
 
+  // ---- 协同调度链：分派/改派/认领/超时升级（工单）+ 生成/重试/回执/回执超时升级（通知） ----
+  // 与危机看板角标、事件回溯同源于统一调度事件流（dispatch_events）+ 业务表实时口径
+  const dispatch = crisisDispatch(crisisId)
+
   // ---- 危机声明：公关起草→法务审核→分渠道发布登记（含分渠道结果与回写口径） ----
   const stmtRows = q('SELECT * FROM crisis_statements WHERE crisis_id=? ORDER BY id ASC', crisisId)
   const statements = {
@@ -150,7 +155,7 @@ export function buildSnapshot(crisisId) {
       id: c.id, title: c.title, level: c.level, status: c.status, topic: c.topic,
       keyword: c.keyword, origin: c.origin, created: c.created, updated: c.updated
     },
-    alerts, timeline, propagation, workOrders, notifications, closures, statements
+    alerts, timeline, propagation, workOrders, notifications, closures, statements, dispatch
   }
 }
 

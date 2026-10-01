@@ -285,6 +285,22 @@ CREATE TABLE IF NOT EXISTS work_order_logs (
   time TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_order_logs_wo ON work_order_logs (wo_id, id);
+-- 协同调度事件流：工单分派/改派/认领/超时升级 与 通知生成/重试/回执/回执超时升级 共享的统一追踪链。
+-- 危机看板角标、处置时间线、复盘统计三处口径同源：实时指标 SQL 直查业务表，流转计数取自本事件流。
+CREATE TABLE IF NOT EXISTS dispatch_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  crisis_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                -- wo 工单流转 / notify 通知流转
+  action TEXT NOT NULL,              -- assign/reassign/claim/wo_escalate1/wo_escalate2/notify_created/retry/manual_retry/send_failed/ack/ack_escalate
+  ref_id INTEGER NOT NULL DEFAULT 0, -- 工单 id 或通知任务 id
+  wo_id INTEGER,                     -- 关联工单（通知事件可回溯到分派来源工单）
+  title TEXT NOT NULL DEFAULT '',    -- 对象标题快照（工单/通知标题）
+  actor TEXT NOT NULL DEFAULT '系统',
+  detail TEXT NOT NULL DEFAULT '',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_events_crisis ON dispatch_events (crisis_id, id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_events_wo ON dispatch_events (wo_id, id);
 -- ===== 舆情传播路径分析 =====
 -- 传播路径：沉淀一个话题的来源、节点、转发关系与影响阶段（seed/ferment/outbreak/decline）
 CREATE TABLE IF NOT EXISTS prop_paths (
@@ -1087,3 +1103,25 @@ function seedStatements() {
     .run(c2.id, '声明送审', `声明「关于预售商品发货延迟问题的说明与补偿方案」提交法务审核（提交人：李澈）`, ago(20))
 }
 seedStatements()
+
+// 协同调度事件流种子/回填（独立幂等：表空时从既有工单日志回填分派/改派/认领/超时升级事件，
+// 保证老库升级后复盘统计的调度链口径完整；通知流转事件由调度器运行时自然产生）
+function seedDispatch() {
+  const n = db.prepare('SELECT COUNT(*) c FROM dispatch_events').get().c
+  if (n > 0) return
+  const rows = db.prepare(`SELECT l.wo_id, l.action, l.detail, l.operator, l.time, w.crisis_id, w.title
+    FROM work_order_logs l JOIN work_orders w ON w.id=l.wo_id
+    WHERE l.action IN ('assigned','claimed','escalated') ORDER BY l.id ASC`).all()
+  const ins = db.prepare(`INSERT INTO dispatch_events (crisis_id,kind,action,ref_id,wo_id,title,actor,detail,time)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+  for (const r of rows) {
+    // 工单日志动作还原为统一调度动作：assigned 覆盖分派/改派（改派 detail 以「改派」开头），
+    // escalated 覆盖两级超时升级（detail 含「二级升级」为二级督办）
+    const det = String(r.detail)
+    const action = r.action === 'claimed' ? 'claim'
+      : r.action === 'escalated' ? (det.includes('二级升级') ? 'wo_escalate2' : 'wo_escalate1')
+      : (det.startsWith('改派') ? 'reassign' : 'assign')
+    ins.run(r.crisis_id, 'wo', action, r.wo_id, r.wo_id, r.title, r.operator, r.detail, r.time)
+  }
+}
+seedDispatch()

@@ -11,7 +11,7 @@
       </div>
       <span class="me">👤 {{ store.user.name }} · {{ roleText(store.user.role) }}</span>
     </div>
-    <p class="hint">🔗 复盘报告汇总<b>预警、处置时间线、传播路径、协同工单、危机声明、通知回执</b>同源快照；支持跨角色分段编制 → 提交审核 → 审核发布（驳回可重编），每次送审/发布/回滚均归档不可变版本，已发布版本可一键回滚；审核通过自动回写结案档案与统计口径。</p>
+    <p class="hint">🔗 复盘报告汇总<b>预警、处置时间线、传播路径、协同工单、危机声明、通知回执、协同调度链</b>同源快照；支持跨角色分段编制 → 提交审核 → 审核发布（驳回可重编），每次送审/发布/回滚均归档不可变版本，已发布版本可一键回滚；审核通过自动回写结案档案与统计口径。</p>
 
     <!-- 创建报告 -->
     <form v-if="showForm" class="rp-form" @submit.prevent="create">
@@ -192,6 +192,37 @@
                   <span v-if="t.ack_by" class="ack">回执：{{ t.ack_by }} · {{ t.ack_at }}<template v-if="t.ack_note">（{{ t.ack_note }}）</template></span>
                   <em>{{ t.sent_at || t.created }}</em>
                 </div>
+              </div>
+            </section>
+
+            <!-- 协同调度链（统一事件流：分派/改派/超时升级 → 通知生成/重试 → 回执/回执超时升级） -->
+            <section v-if="snap.dispatch" class="snap-sec">
+              <h5>🔗 协同调度链路（分派 {{ snap.dispatch.wo.assign }} · 改派 {{ snap.dispatch.wo.reassign }} · 超时升级 {{ snap.dispatch.wo.escalate1 + snap.dispatch.wo.escalate2 }} · 通知重试 {{ snap.dispatch.notify.retry + snap.dispatch.notify.manualRetry }} · 回执 {{ snap.dispatch.notify.ack }}）</h5>
+              <div class="mini-stats">
+                <div><b>{{ snap.dispatch.wo.assign }}</b><em>分派</em></div>
+                <div><b>{{ snap.dispatch.wo.reassign }}</b><em>改派</em></div>
+                <div><b>{{ snap.dispatch.wo.claim }}</b><em>认领</em></div>
+                <div><b class="warn-num">{{ snap.dispatch.wo.escalate1 + snap.dispatch.wo.escalate2 }}</b><em>超时升级</em></div>
+                <div><b>{{ snap.dispatch.notify.created }}</b><em>通知生成</em></div>
+                <div><b>{{ snap.dispatch.notify.retry + snap.dispatch.notify.manualRetry }}</b><em>通知重试</em></div>
+                <div><b class="ok">{{ snap.dispatch.notify.ack }}</b><em>回执确认</em></div>
+                <div><b class="warn-num">{{ snap.dispatch.notify.ackEscalate }}</b><em>回执超时升级</em></div>
+                <div><b>{{ snap.dispatch.ackQuality.ackRate == null ? '—' : snap.dispatch.ackQuality.ackRate + '%' }}</b><em>回执率</em></div>
+                <div><b>{{ snap.dispatch.ackQuality.avgAckMin == null ? '—' : snap.dispatch.ackQuality.avgAckMin + ' 分钟' }}</b><em>平均回执时长</em></div>
+              </div>
+              <div class="dp-live" v-if="snap.dispatch.woEscalated || snap.dispatch.ackPending || snap.dispatch.retrying">
+                <span v-if="snap.dispatch.woEscalated" class="dp-pill esc">⬆ 升级中工单 {{ snap.dispatch.woEscalated }}</span>
+                <span v-if="snap.dispatch.ackPending" class="dp-pill ack">📨 待回执 {{ snap.dispatch.ackPending }}</span>
+                <span v-if="snap.dispatch.retrying" class="dp-pill retry">↻ 重试中 {{ snap.dispatch.retrying }}</span>
+              </div>
+              <div class="snap-list">
+                <div v-for="e in snap.dispatch.events" :key="e.id" class="snap-item">
+                  <span class="tag" :class="e.kind === 'wo' ? 'dp-wo' : 'dp-nt'">{{ e.kind === 'wo' ? '📋' : '🔔' }} {{ e.actionText }}</span>
+                  <b>{{ e.title || ('#' + e.ref_id) }}</b>
+                  <span>{{ e.detail }}</span>
+                  <em>{{ e.actor }} · {{ e.time }}</em>
+                </div>
+                <div v-if="!snap.dispatch.events.length" class="snap-empty">暂无调度链事件（工单分派/通知回执后自动记录）</div>
               </div>
             </section>
 
@@ -471,6 +502,13 @@ input,select,textarea,button{font-family:inherit;}
 .mini-stats div{background:#0c1730;border-radius:7px;padding:6px 14px;text-align:center;display:flex;flex-direction:column;}
 .mini-stats b{color:#fff;font-size:16px;}.mini-stats em{font-size:10px;color:#5b6f94;font-style:normal;}
 .mini-stats b.ok{color:#81c784;}.mini-stats b.warn-num{color:#ffab91;}
+.dp-live{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px;}
+.dp-pill{font-size:10px;padding:2px 9px;border-radius:5px;}
+.dp-pill.esc{background:#3e2723;color:#ffab91;}
+.dp-pill.ack{background:#132a3e;color:#80d8ff;}
+.dp-pill.retry{background:#33270e;color:#ffe082;}
+.tag.dp-wo{background:#0d2137;color:#90caf9;border:1px solid rgba(144,202,249,.3);}
+.tag.dp-nt{background:#132a3e;color:#80d8ff;border:1px solid rgba(77,208,225,.3);}
 .rule-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px;}
 .rule-pill{font-size:10px;padding:2px 9px;border-radius:5px;background:#0d2137;border:1px solid rgba(144,202,249,.25);color:#90caf9;display:inline-flex;gap:6px;align-items:center;}
 .rule-pill.red{color:#ef9a9a;border-color:rgba(239,83,80,.4);}.rule-pill.orange{color:#ffcc80;border-color:rgba(255,152,0,.4);}.rule-pill.yellow{color:#ffe082;border-color:rgba(255,213,79,.4);}
